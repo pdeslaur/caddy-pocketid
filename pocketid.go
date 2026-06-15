@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -28,22 +27,14 @@ const (
 // Middleware gates requests behind PocketID OIDC authentication.
 // Valid sessions are identified by an RS256 id_token stored in a cookie.
 type Middleware struct {
-	Issuer       string             `json:"issuer"`
-	ClientID     string             `json:"client_id"`
-	ClientSecret string             `json:"client_secret"`
-	CookieDomain string             `json:"cookie_domain,omitempty"`
-	CallbackPath string             `json:"callback_path,omitempty"`
-	BypassPaths  []string           `json:"bypass_paths,omitempty"`
-	BypassQuery  []BypassQueryParam `json:"bypass_query,omitempty"`
+	Issuer       string `json:"issuer"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	CookieDomain string `json:"cookie_domain,omitempty"`
+	CallbackPath string `json:"callback_path,omitempty"`
 
 	oidc   *oidcProvider
 	logger *zap.Logger
-}
-
-// BypassQueryParam matches requests where the named query parameter equals the given value.
-type BypassQueryParam struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
 }
 
 func (Middleware) CaddyModule() caddy.ModuleInfo {
@@ -90,19 +81,6 @@ func (m *Middleware) Validate() error {
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if r.URL.Path == m.CallbackPath {
 		return m.handleCallback(w, r)
-	}
-
-	for _, p := range m.BypassPaths {
-		if matchPath(r.URL.Path, p) {
-			return next.ServeHTTP(w, r)
-		}
-	}
-
-	q := r.URL.Query()
-	if slices.ContainsFunc(m.BypassQuery, func(p BypassQueryParam) bool {
-		return q.Get(p.Key) == p.Value
-	}) {
-		return next.ServeHTTP(w, r)
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
@@ -210,14 +188,6 @@ func (m *Middleware) callbackURI(r *http.Request) string {
 	return scheme + "://" + r.Host + m.CallbackPath
 }
 
-func matchPath(path, pattern string) bool {
-	if strings.HasSuffix(pattern, "/*") {
-		prefix := strings.TrimSuffix(pattern, "/*")
-		return path == prefix || strings.HasPrefix(path, prefix+"/")
-	}
-	return path == pattern
-}
-
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	m := &Middleware{}
 	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
@@ -255,19 +225,6 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.CallbackPath = d.Val()
-		case "bypass_paths":
-			m.BypassPaths = d.RemainingArgs()
-			if len(m.BypassPaths) == 0 {
-				return d.ArgErr()
-			}
-		case "bypass_query":
-			args := d.RemainingArgs()
-			if len(args) == 0 || len(args)%2 != 0 {
-				return d.Errf("bypass_query requires key-value pairs")
-			}
-			for i := 0; i < len(args); i += 2 {
-				m.BypassQuery = append(m.BypassQuery, BypassQueryParam{Key: args[i], Value: args[i+1]})
-			}
 		default:
 			return d.Errf("unknown subdirective: %s", d.Val())
 		}

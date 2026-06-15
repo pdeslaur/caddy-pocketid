@@ -217,79 +217,6 @@ func TestOIDCExpiredToken(t *testing.T) {
 	}
 }
 
-// TestOIDCBypassPath checks that requests to bypassed path prefixes skip auth.
-func TestOIDCBypassPath(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-	m.BypassPaths = []string{"/api/*", "/ping"}
-
-	cases := []struct {
-		path    string
-		wantHit bool
-	}{
-		{"/api/v1/users", true},
-		{"/api/", true},
-		{"/ping", true},
-		{"/dashboard", false},
-		{"/apiv1", false},
-	}
-
-	for _, tc := range cases {
-		var hit bool
-		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-			hit = true
-			return nil
-		})
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, tc.path, nil)
-
-		if err := m.ServeHTTP(w, r, next); err != nil {
-			t.Fatalf("%s ServeHTTP: %v", tc.path, err)
-		}
-		if hit != tc.wantHit {
-			t.Errorf("%s: backend hit = %v, want %v", tc.path, hit, tc.wantHit)
-		}
-	}
-}
-
-// TestOIDCBypassQuery checks that requests carrying a bypass query key skip auth.
-func TestOIDCBypassQuery(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-	m.BypassQuery = []BypassQueryParam{
-		{Key: "apikey", Value: "abc"},
-		{Key: "token", Value: "xyz"},
-	}
-
-	cases := []struct {
-		url     string
-		wantHit bool
-	}{
-		{"/resource?apikey=abc", true},
-		{"/resource?token=xyz", true},
-		{"/resource?apikey=wrong", false},
-		{"/resource?other=1", false},
-		{"/resource", false},
-	}
-
-	for _, tc := range cases {
-		var hit bool
-		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-			hit = true
-			return nil
-		})
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, tc.url, nil)
-
-		if err := m.ServeHTTP(w, r, next); err != nil {
-			t.Fatalf("%s ServeHTTP: %v", tc.url, err)
-		}
-		if hit != tc.wantHit {
-			t.Errorf("%s: backend hit = %v, want %v", tc.url, hit, tc.wantHit)
-		}
-	}
-}
-
 // TestOIDCCallbackAuthError checks that a provider error in the callback
 // (e.g. user denied consent) returns 401.
 func TestOIDCCallbackAuthError(t *testing.T) {
@@ -338,31 +265,6 @@ func TestOIDCCallbackMissingPKCECookie(t *testing.T) {
 	}
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
-	}
-}
-
-func TestMatchPath(t *testing.T) {
-	cases := []struct {
-		path    string
-		pattern string
-		want    bool
-	}{
-		{"/api", "/api", true},
-		{"/api/", "/api", false},
-		{"/api/v1", "/api", false},
-		{"/api", "/api/*", true},
-		{"/api/v1", "/api/*", true},
-		{"/api/v1/users", "/api/*", true},
-		{"/apiv1", "/api/*", false},
-		{"/", "/api/*", false},
-		{"/ping", "/ping", true},
-		{"/ping/extra", "/ping", false},
-	}
-	for _, tc := range cases {
-		got := matchPath(tc.path, tc.pattern)
-		if got != tc.want {
-			t.Errorf("matchPath(%q, %q) = %v, want %v", tc.path, tc.pattern, got, tc.want)
-		}
 	}
 }
 

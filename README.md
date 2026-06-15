@@ -4,7 +4,7 @@ A [Caddy](https://caddyserver.com) middleware plugin that protects sites with [P
 
 ## What
 
-`caddy-pocketid` intercepts incoming HTTP requests and enforces authentication via your PocketID instance before passing them to the backend. Unauthenticated requests are redirected through the OpenID Connect authorization code flow with PKCE. Once authenticated, a signed session token is stored in a secure cookie; subsequent requests are validated locally without additional round-trips to PocketID. The plugin supports exempting specific paths or query parameters from authentication for webhooks, health checks, or API keys.
+`caddy-pocketid` intercepts incoming HTTP requests and enforces authentication via your PocketID instance before passing them to the backend. Unauthenticated requests are redirected through the OpenID Connect authorization code flow with PKCE. Once authenticated, a signed session token is stored in a secure cookie; subsequent requests are validated locally without additional round-trips to PocketID.
 
 ## Why
 
@@ -32,31 +32,65 @@ https://<your-domain>/auth/callback
 example.com {
     pocketid_auth {
         issuer        https://id.example.com
-        client_id     {env.POCKETID_CLIENT_ID}
-        client_secret {env.POCKETID_CLIENT_SECRET}
+        client_id     {$POCKETID_CLIENT_ID}
+        client_secret {$POCKETID_CLIENT_SECRET}
     }
 
     reverse_proxy localhost:8080
 }
 ```
 
-A more complete example with optional settings:
+### Exempting paths from authentication
+
+Use Caddy's native matchers to apply `pocketid_auth` only where needed.
+
+**Exempt specific paths** (e.g. a health check and a public API prefix):
 
 ```caddyfile
-app.example.com {
-    pocketid_auth {
-        issuer         https://id.example.com
-        client_id      {env.POCKETID_CLIENT_ID}
-        client_secret  {env.POCKETID_CLIENT_SECRET}
-        cookie_domain  example.com
-        callback_path  /auth/callback
-        bypass_paths   /healthz /api/public/*
-        bypass_query   apikey s3cr3t
+example.com {
+    @protected {
+        not path /healthz /api/public/*
     }
 
-    reverse_proxy localhost:8080
+    handle @protected {
+        pocketid_auth {
+            issuer        https://id.example.com
+            client_id     {$POCKETID_CLIENT_ID}
+            client_secret {$POCKETID_CLIENT_SECRET}
+        }
+        reverse_proxy localhost:8080
+    }
+
+    handle {
+        reverse_proxy localhost:8080
+    }
 }
 ```
+
+**Exempt requests with a specific query parameter** (e.g. an API key):
+
+```caddyfile
+example.com {
+    @protected {
+        not query apikey=s3cr3t
+    }
+
+    handle @protected {
+        pocketid_auth {
+            issuer        https://id.example.com
+            client_id     {$POCKETID_CLIENT_ID}
+            client_secret {$POCKETID_CLIENT_SECRET}
+        }
+        reverse_proxy localhost:8080
+    }
+
+    handle {
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+See the [Caddy matcher documentation](https://caddyserver.com/docs/caddyfile/matchers) for the full list of available matchers.
 
 ## Configuration reference
 
@@ -64,8 +98,6 @@ app.example.com {
 |---|---|---|---|
 | `issuer` | Yes | — | Base URL of your PocketID instance (e.g. `https://id.example.com`). |
 | `client_id` | Yes | — | OAuth2 client ID registered in PocketID. |
-| `client_secret` | Yes | — | OAuth2 client secret. Use `{env.VAR}` to avoid hardcoding. |
+| `client_secret` | Yes | — | OAuth2 client secret. Use `{$VAR}` to avoid hardcoding. |
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
-| `bypass_paths` | No | — | Space-separated list of paths that skip authentication. Append `/*` to match a prefix (e.g. `/api/*` matches `/api/` and all sub-paths). Exact matches are also supported (e.g. `/ping`). |
-| `bypass_query` | No | — | Space-separated key-value pairs. Requests whose query string contains a matching pair bypass authentication (e.g. `apikey s3cr3t` bypasses requests with `?apikey=s3cr3t`). Multiple pairs can be provided; any match is sufficient. |
