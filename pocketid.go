@@ -27,15 +27,29 @@ const (
 // Middleware gates requests behind PocketID OIDC authentication.
 // Valid sessions are identified by an RS256 id_token stored in a cookie.
 type Middleware struct {
-	Issuer       string `json:"issuer"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	CookieDomain string `json:"cookie_domain,omitempty"`
-	CallbackPath string `json:"callback_path,omitempty"`
-	Prompt       string `json:"prompt,omitempty"`
+	Issuer       string        `json:"issuer"`
+	ClientID     string        `json:"client_id"`
+	ClientSecret string        `json:"client_secret"`
+	CookieDomain string        `json:"cookie_domain,omitempty"`
+	CallbackPath string        `json:"callback_path,omitempty"`
+	Prompt       string        `json:"prompt,omitempty"`
+	Headers      []HeaderPair  `json:"headers,omitempty"`
+	ClaimHeaders []ClaimHeader `json:"claim_headers,omitempty"`
 
 	oidc   *oidcProvider
 	logger *zap.Logger
+}
+
+// HeaderPair is a static header injected into every authenticated request.
+type HeaderPair struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// ClaimHeader maps a JWT claim to a request header injected into authenticated requests.
+type ClaimHeader struct {
+	Claim  string `json:"claim"`
+	Header string `json:"header"`
 }
 
 func (Middleware) CaddyModule() caddy.ModuleInfo {
@@ -85,14 +99,30 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		if err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
-			return next.ServeHTTP(w, r)
-		} else {
-			m.logger.Debug("rejecting token cookie", zap.Error(err))
+		if claims, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
+			return next.ServeHTTP(w, m.injectHeaders(r, claims))
 		}
+		m.logger.Debug("rejecting token cookie", zap.Error(err))
 	}
 
 	return m.redirectToAuth(w, r)
+}
+
+// injectHeaders clones the request and sets static and claim-derived headers.
+func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http.Request {
+	if len(m.Headers) == 0 && len(m.ClaimHeaders) == 0 {
+		return r
+	}
+	r = r.Clone(r.Context())
+	for _, h := range m.Headers {
+		r.Header.Set(h.Key, h.Value)
+	}
+	for _, ch := range m.ClaimHeaders {
+		if v, ok := claims[ch.Claim].(string); ok {
+			r.Header.Set(ch.Header, v)
+		}
+	}
+	return r
 }
 
 func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) error {
@@ -127,7 +157,7 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	if err := m.oidc.validateToken(r.Context(), idToken, m.ClientID); err != nil {
+	if _, err := m.oidc.validateToken(r.Context(), idToken, m.ClientID); err != nil {
 		m.logger.Error("id_token validation failed", zap.Error(err))
 		http.Error(w, "invalid id_token", http.StatusBadGateway)
 		return nil
@@ -231,6 +261,18 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.Prompt = d.Val()
+		case "set_header":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return d.Errf("set_header requires exactly two arguments: key value")
+			}
+			m.Headers = append(m.Headers, HeaderPair{Key: args[0], Value: args[1]})
+		case "forward_claim":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return d.Errf("forward_claim requires exactly two arguments: claim header")
+			}
+			m.ClaimHeaders = append(m.ClaimHeaders, ClaimHeader{Claim: args[0], Header: args[1]})
 		default:
 			return d.Errf("unknown subdirective: %s", d.Val())
 		}

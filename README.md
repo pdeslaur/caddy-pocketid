@@ -102,3 +102,5 @@ See the [Caddy matcher documentation](https://caddyserver.com/docs/caddyfile/mat
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
 | `prompt` | No | — | OIDC [`prompt` parameter](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) sent on every authorization request. Common values: `login` (force re-authentication), `consent` (force consent screen), `select_account`, `none`. |
+| `set_header key value` | No | — | Inject a static header into every authenticated request before it reaches the backend. Can be repeated. Use `{$VAR}` for secrets (e.g. a shared Basic Auth credential). |
+| `forward_claim claim header` | No | — | Forward a JWT claim from the session token as a request header. Can be repeated. Common claims: `sub`, `email`, `name`, `preferred_username`. |

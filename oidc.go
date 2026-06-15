@@ -24,10 +24,17 @@ func newOIDCProvider(ctx context.Context, issuer string) (*oidcProvider, error) 
 	return &oidcProvider{provider: provider}, nil
 }
 
-func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID string) error {
+func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID string) (map[string]any, error) {
 	verifier := p.provider.Verifier(&oidc.Config{ClientID: clientID})
-	_, err := verifier.Verify(oidc.ClientContext(ctx, oidcHTTPClient), tokenStr)
-	return err
+	idToken, err := verifier.Verify(oidc.ClientContext(ctx, oidcHTTPClient), tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	var claims map[string]any
+	if err := idToken.Claims(&claims); err != nil {
+		return nil, fmt.Errorf("extracting claims: %w", err)
+	}
+	return claims, nil
 }
 
 func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI, clientID, clientSecret string) (string, error) {

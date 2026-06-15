@@ -183,6 +183,128 @@ func TestOIDCAlreadyAuthenticated(t *testing.T) {
 	}
 }
 
+// TestSetHeader checks that static headers are injected into authenticated requests.
+func TestSetHeader(t *testing.T) {
+	signer, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+	m.Headers = []HeaderPair{
+		{Key: "Authorization", Value: "Basic dXNlcjpwYXNz"},
+		{Key: "X-Auth-Source", Value: "pocketid"},
+	}
+
+	token, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer:   issuerURL,
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+		Expiry:   jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
+		Subject:  "test-subject",
+		Audience: jwt.Audience{"test-client"},
+	}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	var gotAuth, gotSource string
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		gotAuth = r.Header.Get("Authorization")
+		gotSource = r.Header.Get("X-Auth-Source")
+		return nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+
+	if err := m.ServeHTTP(w, r, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if gotAuth != "Basic dXNlcjpwYXNz" {
+		t.Errorf("Authorization = %q, want Basic dXNlcjpwYXNz", gotAuth)
+	}
+	if gotSource != "pocketid" {
+		t.Errorf("X-Auth-Source = %q, want pocketid", gotSource)
+	}
+}
+
+// TestForwardClaim checks that JWT claims are forwarded as request headers.
+func TestForwardClaim(t *testing.T) {
+	signer, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+	m.ClaimHeaders = []ClaimHeader{
+		{Claim: "sub", Header: "X-Remote-User"},
+		{Claim: "email", Header: "X-Remote-Email"},
+	}
+
+	type customClaims struct {
+		jwt.Claims
+		Email string `json:"email"`
+	}
+	token, err := jwt.Signed(signer).Claims(customClaims{
+		Claims: jwt.Claims{
+			Issuer:   issuerURL,
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+			Expiry:   jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
+			Subject:  "user-123",
+			Audience: jwt.Audience{"test-client"},
+		},
+		Email: "alice@example.com",
+	}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	var gotUser, gotEmail string
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		gotUser = r.Header.Get("X-Remote-User")
+		gotEmail = r.Header.Get("X-Remote-Email")
+		return nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+
+	if err := m.ServeHTTP(w, r, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if gotUser != "user-123" {
+		t.Errorf("X-Remote-User = %q, want user-123", gotUser)
+	}
+	if gotEmail != "alice@example.com" {
+		t.Errorf("X-Remote-Email = %q, want alice@example.com", gotEmail)
+	}
+}
+
+// TestHeadersNotInjectedWhenUnauthenticated checks headers are not leaked on redirect.
+func TestHeadersNotInjectedWhenUnauthenticated(t *testing.T) {
+	_, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+	m.Headers = []HeaderPair{{Key: "Authorization", Value: "Basic dXNlcjpwYXNz"}}
+
+	var gotAuth string
+	var backendHit bool
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		gotAuth = r.Header.Get("Authorization")
+		backendHit = true
+		return nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+
+	if err := m.ServeHTTP(w, r, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if backendHit {
+		t.Error("backend reached on unauthenticated request")
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty", gotAuth)
+	}
+	if w.Code != http.StatusFound {
+		t.Errorf("status = %d, want 302", w.Code)
+	}
+}
+
 // TestOIDCExpiredToken checks that an expired session cookie triggers a redirect
 // to re-authenticate rather than passing through.
 func TestOIDCExpiredToken(t *testing.T) {
