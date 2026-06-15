@@ -36,7 +36,7 @@ func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirec
 		ClientSecret: clientSecret,
 		Endpoint:     p.provider.Endpoint(),
 		RedirectURL:  redirectURI,
-		Scopes:       []string{oidc.ScopeOpenID},
+		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
 	}
 	token, err := cfg.Exchange(
 		oidc.ClientContext(ctx, oidcHTTPClient),
@@ -53,15 +53,19 @@ func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirec
 	return raw, nil
 }
 
-func (p *oidcProvider) authURL(clientID, redirectURI, state, challenge string) string {
+func (p *oidcProvider) authURL(clientID, redirectURI, state, challenge, prompt string) string {
 	cfg := &oauth2.Config{
 		ClientID:    clientID,
 		Endpoint:    p.provider.Endpoint(),
 		RedirectURL: redirectURI,
-		Scopes:      []string{oidc.ScopeOpenID},
+		Scopes:      []string{oidc.ScopeOpenID, "email", "profile"},
 	}
-	return cfg.AuthCodeURL(state,
+	opts := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("code_challenge", challenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-	)
+	}
+	if prompt != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("prompt", prompt))
+	}
+	return cfg.AuthCodeURL(state, opts...)
 }

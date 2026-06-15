@@ -32,6 +32,7 @@ type Middleware struct {
 	ClientSecret string `json:"client_secret"`
 	CookieDomain string `json:"cookie_domain,omitempty"`
 	CallbackPath string `json:"callback_path,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`
 
 	oidc   *oidcProvider
 	logger *zap.Logger
@@ -164,7 +165,7 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 
 	returnURL := r.URL.RequestURI()
 	state := encodeState(returnURL, m.ClientSecret)
-	authURL := m.oidc.authURL(m.ClientID, m.callbackURI(r), state, challenge)
+	authURL := m.oidc.authURL(m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     pkceCookieName,
@@ -225,6 +226,11 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.CallbackPath = d.Val()
+		case "prompt":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.Prompt = d.Val()
 		default:
 			return d.Errf("unknown subdirective: %s", d.Val())
 		}

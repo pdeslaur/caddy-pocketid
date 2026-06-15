@@ -101,3 +101,4 @@ See the [Caddy matcher documentation](https://caddyserver.com/docs/caddyfile/mat
 | `client_secret` | Yes | — | OAuth2 client secret. Use `{$VAR}` to avoid hardcoding. |
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
+| `prompt` | No | — | OIDC [`prompt` parameter](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) sent on every authorization request. Common values: `login` (force re-authentication), `consent` (force consent screen), `select_account`, `none`. |
