@@ -17,6 +17,7 @@ import (
 func init() {
 	caddy.RegisterModule(Middleware{})
 	httpcaddyfile.RegisterHandlerDirective("pocketid_auth", parseCaddyfile)
+	httpcaddyfile.RegisterDirectiveOrder("pocketid_auth", httpcaddyfile.Before, "basicauth")
 }
 
 const (
