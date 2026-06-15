@@ -3,6 +3,7 @@ package pocketid
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -17,7 +18,10 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("pocketid_auth", parseCaddyfile)
 }
 
-const cookieName = "pocketid_token"
+const (
+	cookieName     = "pocketid_token"
+	pkceCookieName = "pocketid_pkce"
+)
 
 // Middleware gates requests behind PocketID OIDC authentication.
 // Valid sessions are identified by an RS256 id_token stored in a cookie.
@@ -28,7 +32,7 @@ type Middleware struct {
 	CookieDomain string   `json:"cookie_domain,omitempty"`
 	CallbackPath string   `json:"callback_path,omitempty"`
 	BypassPaths  []string `json:"bypass_paths,omitempty"`
-	BypassQuery  string   `json:"bypass_query,omitempty"`
+	BypassQuery  []string `json:"bypass_query,omitempty"`
 
 	oidc   *oidcProvider
 	logger *zap.Logger
@@ -57,11 +61,21 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 
 	m.logger = ctx.Logger()
 
-	provider, err := newOIDCProvider(m.Issuer)
+	provider, err := newOIDCProvider(ctx, m.Issuer)
 	if err != nil {
 		return fmt.Errorf("initializing OIDC provider: %w", err)
 	}
 	m.oidc = provider
+	return nil
+}
+
+func (m *Middleware) Validate() error {
+	if _, err := url.ParseRequestURI(m.Issuer); err != nil {
+		return fmt.Errorf("invalid issuer URL: %w", err)
+	}
+	if !strings.HasPrefix(m.CallbackPath, "/") {
+		return fmt.Errorf("callback_path must begin with /")
+	}
 	return nil
 }
 
@@ -76,12 +90,14 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		}
 	}
 
-	if m.BypassQuery != "" && r.URL.Query().Has(m.BypassQuery) {
-		return next.ServeHTTP(w, r)
+	for _, q := range m.BypassQuery {
+		if r.URL.Query().Has(q) {
+			return next.ServeHTTP(w, r)
+		}
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		if _, err := m.oidc.validateToken(cookie.Value, m.ClientID); err == nil {
+		if _, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
 			return next.ServeHTTP(w, r)
 		} else {
 			m.logger.Debug("rejecting token cookie", zap.Error(err))
@@ -109,7 +125,7 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	verifierCookie, err := r.Cookie("pocketid_pkce")
+	verifierCookie, err := r.Cookie(pkceCookieName)
 	if err != nil {
 		http.Error(w, "missing pkce cookie", http.StatusBadRequest)
 		return nil
@@ -138,7 +154,7 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 	})
 
 	http.SetCookie(w, &http.Cookie{
-		Name:   "pocketid_pkce",
+		Name:   pkceCookieName,
 		Value:  "",
 		MaxAge: -1,
 	})
@@ -158,7 +174,7 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 	authURL := m.oidc.authURL(m.ClientID, m.callbackURI(r), state, challenge)
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     "pocketid_pkce",
+		Name:     pkceCookieName,
 		Value:    verifier,
 		Path:     m.CallbackPath,
 		HttpOnly: true,
@@ -172,7 +188,11 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 }
 
 func (m *Middleware) callbackURI(r *http.Request) string {
-	return "https://" + r.Host + m.CallbackPath
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host + m.CallbackPath
 }
 
 func matchPath(path, pattern string) bool {
@@ -226,10 +246,10 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 		case "bypass_query":
-			if !d.NextArg() {
+			m.BypassQuery = d.RemainingArgs()
+			if len(m.BypassQuery) == 0 {
 				return d.ArgErr()
 			}
-			m.BypassQuery = d.Val()
 		default:
 			return d.Errf("unknown subdirective: %s", d.Val())
 		}
@@ -239,6 +259,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 var (
 	_ caddy.Provisioner           = (*Middleware)(nil)
+	_ caddy.Validator             = (*Middleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Middleware)(nil)
 	_ caddyfile.Unmarshaler       = (*Middleware)(nil)
 )

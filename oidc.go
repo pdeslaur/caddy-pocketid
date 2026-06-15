@@ -9,10 +9,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 )
+
+var oidcHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 type oidcProvider struct {
 	issuer        string
@@ -30,9 +33,13 @@ type discoveryDoc struct {
 	JWKSURI               string `json:"jwks_uri"`
 }
 
-func newOIDCProvider(issuer string) (*oidcProvider, error) {
+func newOIDCProvider(ctx context.Context, issuer string) (*oidcProvider, error) {
 	discoveryURL := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
-	resp, err := http.Get(discoveryURL) //nolint:noctx
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building discovery request: %w", err)
+	}
+	resp, err := oidcHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching discovery document: %w", err)
 	}
@@ -54,15 +61,17 @@ func newOIDCProvider(issuer string) (*oidcProvider, error) {
 		jwksURI:       doc.JWKSURI,
 	}
 
-	if err := p.fetchKeys(); err != nil {
+	if err := p.fetchKeys(ctx); err != nil {
 		return nil, fmt.Errorf("fetching JWKS: %w", err)
 	}
 
 	return p, nil
 }
 
-func (p *oidcProvider) fetchKeys() error {
-	keys, err := jwk.Fetch(context.Background(), p.jwksURI)
+func (p *oidcProvider) fetchKeys(ctx context.Context) error {
+	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	keys, err := jwk.Fetch(fetchCtx, p.jwksURI)
 	if err != nil {
 		return err
 	}
@@ -72,29 +81,31 @@ func (p *oidcProvider) fetchKeys() error {
 	return nil
 }
 
-func (p *oidcProvider) keyFunc(token *jwt.Token) (interface{}, error) {
-	kid, ok := token.Header["kid"].(string)
-	if !ok {
-		return nil, fmt.Errorf("missing kid in token header")
-	}
-
-	key, found := p.lookupKey(kid)
-	if !found {
-		// Re-fetch once to handle key rotation.
-		if err := p.fetchKeys(); err != nil {
-			return nil, fmt.Errorf("re-fetching JWKS: %w", err)
+func (p *oidcProvider) makeKeyFunc(ctx context.Context) jwt.Keyfunc {
+	return func(token *jwt.Token) (interface{}, error) {
+		kid, ok := token.Header["kid"].(string)
+		if !ok {
+			return nil, fmt.Errorf("missing kid in token header")
 		}
-		key, found = p.lookupKey(kid)
+
+		key, found := p.lookupKey(kid)
 		if !found {
-			return nil, fmt.Errorf("unknown key id: %s", kid)
+			// Re-fetch once to handle key rotation.
+			if err := p.fetchKeys(ctx); err != nil {
+				return nil, fmt.Errorf("re-fetching JWKS: %w", err)
+			}
+			key, found = p.lookupKey(kid)
+			if !found {
+				return nil, fmt.Errorf("unknown key id: %s", kid)
+			}
 		}
-	}
 
-	var raw interface{}
-	if err := key.Raw(&raw); err != nil {
-		return nil, fmt.Errorf("extracting raw key: %w", err)
+		var raw interface{}
+		if err := key.Raw(&raw); err != nil {
+			return nil, fmt.Errorf("extracting raw key: %w", err)
+		}
+		return raw, nil
 	}
-	return raw, nil
 }
 
 func (p *oidcProvider) lookupKey(kid string) (jwk.Key, bool) {
@@ -103,8 +114,8 @@ func (p *oidcProvider) lookupKey(kid string) (jwk.Key, bool) {
 	return p.keys.LookupKeyID(kid)
 }
 
-func (p *oidcProvider) validateToken(tokenStr, clientID string) (jwt.MapClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, jwt.MapClaims{}, p.keyFunc,
+func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID string) (jwt.MapClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenStr, jwt.MapClaims{}, p.makeKeyFunc(ctx),
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(p.issuer),
 		jwt.WithAudience(clientID),
@@ -140,7 +151,7 @@ func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirec
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oidcHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("token exchange request: %w", err)
 	}

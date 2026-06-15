@@ -1,0 +1,14 @@
+# Binaries
+caddy
+*.exe
+
+# Test output
+*.test
+*.out
+coverage.html
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
