@@ -6,13 +6,13 @@ import (
 	"encoding/base64"
 )
 
-func generatePKCE() (verifier, challenge string, err error) {
+func generatePKCE() (string, string, error) {
 	b := make([]byte, 32)
-	if _, err = rand.Read(b); err != nil {
-		return
+	if _, err := rand.Read(b); err != nil {
+		return "", "", err
 	}
-	verifier = base64.RawURLEncoding.EncodeToString(b)
+	verifier := base64.RawURLEncoding.EncodeToString(b)
 	sum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
-	return
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	return verifier, challenge, nil
 }

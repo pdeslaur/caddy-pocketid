@@ -18,7 +18,7 @@ func encodeState(returnURL, secret string) string {
 	return encoded + "." + sig
 }
 
-func verifyState(state, secret string) (returnURL string, err error) {
+func verifyState(state, secret string) (string, error) {
 	parts := strings.SplitN(state, ".", 2)
 	if len(parts) != 2 {
 		return "", fmt.Errorf("invalid state format")
@@ -28,7 +28,7 @@ func verifyState(state, secret string) (returnURL string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("decoding state payload: %w", err)
 	}
-	returnURL = string(urlBytes)
+	returnURL := string(urlBytes)
 
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(returnURL))

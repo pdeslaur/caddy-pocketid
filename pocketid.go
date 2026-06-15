@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -26,16 +27,22 @@ const (
 // Middleware gates requests behind PocketID OIDC authentication.
 // Valid sessions are identified by an RS256 id_token stored in a cookie.
 type Middleware struct {
-	Issuer       string   `json:"issuer"`
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret"`
-	CookieDomain string   `json:"cookie_domain,omitempty"`
-	CallbackPath string   `json:"callback_path,omitempty"`
-	BypassPaths  []string `json:"bypass_paths,omitempty"`
-	BypassQuery  []string `json:"bypass_query,omitempty"`
+	Issuer       string             `json:"issuer"`
+	ClientID     string             `json:"client_id"`
+	ClientSecret string             `json:"client_secret"`
+	CookieDomain string             `json:"cookie_domain,omitempty"`
+	CallbackPath string             `json:"callback_path,omitempty"`
+	BypassPaths  []string           `json:"bypass_paths,omitempty"`
+	BypassQuery  []BypassQueryParam `json:"bypass_query,omitempty"`
 
 	oidc   *oidcProvider
 	logger *zap.Logger
+}
+
+// BypassQueryParam matches requests where the named query parameter equals the given value.
+type BypassQueryParam struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 func (Middleware) CaddyModule() caddy.ModuleInfo {
@@ -90,14 +97,15 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		}
 	}
 
-	for _, q := range m.BypassQuery {
-		if r.URL.Query().Has(q) {
-			return next.ServeHTTP(w, r)
-		}
+	q := r.URL.Query()
+	if slices.ContainsFunc(m.BypassQuery, func(p BypassQueryParam) bool {
+		return q.Get(p.Key) == p.Value
+	}) {
+		return next.ServeHTTP(w, r)
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		if _, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
+		if err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
 			return next.ServeHTTP(w, r)
 		} else {
 			m.logger.Debug("rejecting token cookie", zap.Error(err))
@@ -139,6 +147,12 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
+	if err := m.oidc.validateToken(r.Context(), idToken, m.ClientID); err != nil {
+		m.logger.Error("id_token validation failed", zap.Error(err))
+		http.Error(w, "invalid id_token", http.StatusBadGateway)
+		return nil
+	}
+
 	cookieDomain := ""
 	if m.CookieDomain != "" {
 		cookieDomain = "." + m.CookieDomain
@@ -149,7 +163,7 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		Domain:   cookieDomain,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 	})
 
@@ -178,7 +192,7 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 		Value:    verifier,
 		Path:     m.CallbackPath,
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   300,
 	})
@@ -246,9 +260,12 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 		case "bypass_query":
-			m.BypassQuery = d.RemainingArgs()
-			if len(m.BypassQuery) == 0 {
-				return d.ArgErr()
+			args := d.RemainingArgs()
+			if len(args) == 0 || len(args)%2 != 0 {
+				return d.Errf("bypass_query requires key-value pairs")
+			}
+			for i := 0; i < len(args); i += 2 {
+				m.BypassQuery = append(m.BypassQuery, BypassQueryParam{Key: args[i], Value: args[i+1]})
 			}
 		default:
 			return d.Errf("unknown subdirective: %s", d.Val())
