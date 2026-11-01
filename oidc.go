@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -12,20 +13,40 @@ import (
 
 var oidcHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+// oidcProvider performs OIDC discovery lazily on first use, so Caddy can start
+// even when the issuer is unreachable (e.g. PocketID is served by the same
+// Caddy instance). Failed discovery is retried on the next call.
 type oidcProvider struct {
+	issuer string
+
+	mu       sync.Mutex
 	provider *oidc.Provider
 }
 
-func newOIDCProvider(ctx context.Context, issuer string) (*oidcProvider, error) {
-	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, oidcHTTPClient), issuer)
+func newOIDCProvider(issuer string) *oidcProvider {
+	return &oidcProvider{issuer: issuer}
+}
+
+func (p *oidcProvider) get(ctx context.Context) (*oidc.Provider, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.provider != nil {
+		return p.provider, nil
+	}
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, oidcHTTPClient), p.issuer)
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery: %w", err)
 	}
-	return &oidcProvider{provider: provider}, nil
+	p.provider = provider
+	return provider, nil
 }
 
 func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID string) (map[string]any, error) {
-	verifier := p.provider.Verifier(&oidc.Config{ClientID: clientID})
+	provider, err := p.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	verifier := provider.Verifier(&oidc.Config{ClientID: clientID})
 	idToken, err := verifier.Verify(oidc.ClientContext(ctx, oidcHTTPClient), tokenStr)
 	if err != nil {
 		return nil, err
@@ -38,10 +59,14 @@ func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID str
 }
 
 func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI, clientID, clientSecret string) (string, error) {
+	provider, err := p.get(ctx)
+	if err != nil {
+		return "", err
+	}
 	cfg := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Endpoint:     p.provider.Endpoint(),
+		Endpoint:     provider.Endpoint(),
 		RedirectURL:  redirectURI,
 		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
 	}
@@ -60,10 +85,14 @@ func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirec
 	return raw, nil
 }
 
-func (p *oidcProvider) authURL(clientID, redirectURI, state, challenge, prompt string) string {
+func (p *oidcProvider) authURL(ctx context.Context, clientID, redirectURI, state, challenge, prompt string) (string, error) {
+	provider, err := p.get(ctx)
+	if err != nil {
+		return "", err
+	}
 	cfg := &oauth2.Config{
 		ClientID:    clientID,
-		Endpoint:    p.provider.Endpoint(),
+		Endpoint:    provider.Endpoint(),
 		RedirectURL: redirectURI,
 		Scopes:      []string{oidc.ScopeOpenID, "email", "profile"},
 	}
@@ -74,5 +103,5 @@ func (p *oidcProvider) authURL(clientID, redirectURI, state, challenge, prompt s
 	if prompt != "" {
 		opts = append(opts, oauth2.SetAuthURLParam("prompt", prompt))
 	}
-	return cfg.AuthCodeURL(state, opts...)
+	return cfg.AuthCodeURL(state, opts...), nil
 }

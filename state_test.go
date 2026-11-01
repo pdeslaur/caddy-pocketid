@@ -1,6 +1,7 @@
 package pocketid
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -18,20 +19,37 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			state := encodeState(tc.url, tc.secret)
+			state := encodeState("nonce", tc.url, tc.secret)
 			got, err := verifyState(state, tc.secret)
 			if err != nil {
 				t.Fatalf("verifyState: %v", err)
 			}
-			if got != tc.url {
-				t.Errorf("got %q, want %q", got, tc.url)
+			if got.ReturnURL != tc.url {
+				t.Errorf("ReturnURL = %q, want %q", got.ReturnURL, tc.url)
+			}
+			if got.Nonce != "nonce" {
+				t.Errorf("Nonce = %q, want nonce", got.Nonce)
 			}
 		})
 	}
 }
 
+func TestGenerateNonceUnique(t *testing.T) {
+	a, err := generateNonce()
+	if err != nil {
+		t.Fatalf("generateNonce: %v", err)
+	}
+	b, err := generateNonce()
+	if err != nil {
+		t.Fatalf("generateNonce: %v", err)
+	}
+	if a == b {
+		t.Error("two calls returned the same nonce")
+	}
+}
+
 func TestStateWrongSecret(t *testing.T) {
-	state := encodeState("/foo", "secret")
+	state := encodeState("nonce", "/foo", "secret")
 	_, err := verifyState(state, "wrong")
 	if err == nil {
 		t.Error("expected error with wrong secret, got nil")
@@ -39,7 +57,7 @@ func TestStateWrongSecret(t *testing.T) {
 }
 
 func TestStateTamperedSignature(t *testing.T) {
-	state := encodeState("/foo", "secret")
+	state := encodeState("nonce", "/foo", "secret")
 	dot := strings.Index(state, ".")
 	tampered := state[:dot+1] + "invalidsig"
 	_, err := verifyState(tampered, "secret")
@@ -56,8 +74,16 @@ func TestStateInvalidFormat(t *testing.T) {
 }
 
 func TestStateInvalidBase64Payload(t *testing.T) {
-	_, err := verifyState("!!!.sig", "secret")
+	_, err := verifyState("!!!."+signState("!!!", "secret"), "secret")
 	if err == nil {
 		t.Error("expected error for invalid base64 payload, got nil")
+	}
+}
+
+func TestStateMissingNonce(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(`{"r":"/foo"}`))
+	_, err := verifyState(encoded+"."+signState(encoded, "secret"), "secret")
+	if err == nil {
+		t.Error("expected error for state without nonce, got nil")
 	}
 }

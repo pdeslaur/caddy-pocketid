@@ -2,12 +2,14 @@ package pocketid
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -378,7 +380,7 @@ func TestOIDCCallbackMissingPKCECookie(t *testing.T) {
 	_, issuerURL := oidctest.NewIssuer(t)
 	m := newTestMiddleware(t, issuerURL)
 
-	state := encodeState("/dashboard", m.ClientSecret)
+	state := encodeState("nonce", "/dashboard", m.ClientSecret)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+state, nil)
 
@@ -402,5 +404,170 @@ func TestCallbackURIScheme(t *testing.T) {
 	r.TLS = &tls.ConnectionState{}
 	if got := m.callbackURI(r); got != "https://example.com/auth/callback" {
 		t.Errorf("TLS request: got %q", got)
+	}
+}
+
+// TestForwardClaimStripsClientHeader checks that a client-supplied header named
+// by forward_claim never reaches the backend when the token lacks that claim.
+func TestForwardClaimStripsClientHeader(t *testing.T) {
+	signer, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+	m.ClaimHeaders = []ClaimHeader{{Claim: "email", Header: "X-Remote-Email"}}
+
+	token, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer:   issuerURL,
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+		Expiry:   jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
+		Subject:  "user-123",
+		Audience: jwt.Audience{"test-client"},
+	}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	var gotEmail []string
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		gotEmail = r.Header.Values("X-Remote-Email")
+		return nil
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	r.Header.Set("X-Remote-Email", "admin@example.com")
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+
+	if err := m.ServeHTTP(w, r, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if len(gotEmail) != 0 {
+		t.Errorf("X-Remote-Email = %q, want absent", gotEmail)
+	}
+}
+
+// TestOIDCFullFlowClearsPKCECookie checks that the PKCE verifier cookie is
+// removed once the callback completes.
+func TestOIDCFullFlowClearsPKCECookie(t *testing.T) {
+	_, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+
+	srv := httptest.NewTLSServer(serveMiddleware(m, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintln(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+
+	jar, _ := cookiejar.New(nil)
+	client := srv.Client()
+	client.Jar = jar
+
+	resp, err := client.Get(srv.URL + "/dashboard")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	callbackURL, _ := url.Parse(srv.URL + m.CallbackPath)
+	for _, c := range jar.Cookies(callbackURL) {
+		if strings.HasPrefix(c.Name, pkceCookiePrefix) {
+			t.Errorf("PKCE cookie %q still present after callback", c.Name)
+		}
+	}
+}
+
+// TestOIDCConcurrentFlows checks that starting a second login flow in the same
+// browser does not break one already in progress.
+func TestOIDCConcurrentFlows(t *testing.T) {
+	_, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+
+	var gotPath string
+	srv := httptest.NewTLSServer(serveMiddleware(m, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RequestURI()
+		_, _ = fmt.Fprintln(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+
+	jar, _ := cookiejar.New(nil)
+	noFollowClient := srv.Client()
+	noFollowClient.Jar = jar
+	noFollowClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	startFlow := func(path string) string {
+		t.Helper()
+		resp, err := noFollowClient.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("GET %s: status = %d, want 302", path, resp.StatusCode)
+		}
+		return resp.Header.Get("Location")
+	}
+	first := startFlow("/first")
+	second := startFlow("/second")
+
+	client := srv.Client()
+	client.Jar = jar
+	client.CheckRedirect = nil
+	for _, tc := range []struct{ authURL, wantPath string }{
+		{first, "/first"},
+		{second, "/second"},
+	} {
+		resp, err := client.Get(tc.authURL)
+		if err != nil {
+			t.Fatalf("completing flow for %s: %v", tc.wantPath, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("flow for %s: status = %d, want 200", tc.wantPath, resp.StatusCode)
+		}
+		if gotPath != tc.wantPath {
+			t.Errorf("flow for %s: landed on %q", tc.wantPath, gotPath)
+		}
+	}
+}
+
+// TestProvisionIssuerUnavailable checks that Provision succeeds while the
+// issuer is unreachable, requests fail with 502, and discovery is retried
+// once the issuer comes up.
+func TestProvisionIssuerUnavailable(t *testing.T) {
+	var available atomic.Bool
+	var issuer *httptest.Server
+	issuer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !available.Load() {
+			http.Error(w, "starting up", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":%q}`,
+			issuer.URL, issuer.URL+"/authorize", issuer.URL+"/token", issuer.URL+"/keys")
+	}))
+	t.Cleanup(issuer.Close)
+
+	m := newTestMiddleware(t, issuer.URL)
+
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	err := m.ServeHTTP(httptest.NewRecorder(), r, nopNext)
+	var herr caddyhttp.HandlerError
+	if !errors.As(err, &herr) || herr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("ServeHTTP with issuer down: got %v, want 502 HandlerError", err)
+	}
+
+	available.Store(true)
+
+	w := httptest.NewRecorder()
+	if err := m.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/dashboard", nil), nopNext); err != nil {
+		t.Fatalf("ServeHTTP with issuer up: %v", err)
+	}
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+	if loc := w.Header().Get("Location"); !strings.HasPrefix(loc, issuer.URL+"/authorize") {
+		t.Errorf("Location = %q, want prefix %s/authorize", loc, issuer.URL)
 	}
 }

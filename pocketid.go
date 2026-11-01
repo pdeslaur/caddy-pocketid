@@ -20,8 +20,10 @@ func init() {
 }
 
 const (
-	cookieName     = "pocketid_token"
-	pkceCookieName = "pocketid_pkce"
+	cookieName = "pocketid_token"
+	// pkceCookiePrefix is followed by the state nonce, giving each login flow
+	// its own verifier cookie.
+	pkceCookiePrefix = "pocketid_pkce_"
 )
 
 // Middleware gates requests behind PocketID OIDC authentication.
@@ -74,12 +76,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	}
 
 	m.logger = ctx.Logger()
-
-	provider, err := newOIDCProvider(ctx, m.Issuer)
-	if err != nil {
-		return fmt.Errorf("initializing OIDC provider: %w", err)
-	}
-	m.oidc = provider
+	m.oidc = newOIDCProvider(m.Issuer)
 	return nil
 }
 
@@ -94,12 +91,18 @@ func (m *Middleware) Validate() error {
 }
 
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if _, err := m.oidc.get(r.Context()); err != nil {
+		m.logger.Error("OIDC provider unavailable", zap.Error(err))
+		return caddyhttp.Error(http.StatusBadGateway, err)
+	}
+
 	if r.URL.Path == m.CallbackPath {
 		return m.handleCallback(w, r)
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		if claims, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID); err == nil {
+		claims, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID)
+		if err == nil {
 			return next.ServeHTTP(w, m.injectHeaders(r, claims))
 		}
 		m.logger.Debug("rejecting token cookie", zap.Error(err))
@@ -109,6 +112,8 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 }
 
 // injectHeaders clones the request and sets static and claim-derived headers.
+// Claim headers are always removed from the incoming request first, so a
+// client cannot supply its own value when the claim is absent from the token.
 func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http.Request {
 	if len(m.Headers) == 0 && len(m.ClaimHeaders) == 0 {
 		return r
@@ -118,6 +123,7 @@ func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http
 		r.Header.Set(h.Key, h.Value)
 	}
 	for _, ch := range m.ClaimHeaders {
+		r.Header.Del(ch.Header)
 		if v, ok := claims[ch.Claim].(string); ok {
 			r.Header.Set(ch.Header, v)
 		}
@@ -136,14 +142,14 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	returnURL, err := verifyState(stateParam, m.ClientSecret)
+	state, err := verifyState(stateParam, m.ClientSecret)
 	if err != nil {
 		m.logger.Warn("invalid state in callback", zap.Error(err))
 		http.Error(w, "invalid state", http.StatusBadRequest)
 		return nil
 	}
 
-	verifierCookie, err := r.Cookie(pkceCookieName)
+	verifierCookie, err := r.Cookie(pkceCookiePrefix + state.Nonce)
 	if err != nil {
 		http.Error(w, "missing pkce cookie", http.StatusBadRequest)
 		return nil
@@ -178,12 +184,13 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 	})
 
 	http.SetCookie(w, &http.Cookie{
-		Name:   pkceCookieName,
+		Name:   verifierCookie.Name,
 		Value:  "",
+		Path:   m.CallbackPath,
 		MaxAge: -1,
 	})
 
-	http.Redirect(w, r, returnURL, http.StatusFound)
+	http.Redirect(w, r, state.ReturnURL, http.StatusFound)
 	return nil
 }
 
@@ -192,13 +199,19 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return fmt.Errorf("generating PKCE: %w", err)
 	}
+	nonce, err := generateNonce()
+	if err != nil {
+		return fmt.Errorf("generating nonce: %w", err)
+	}
 
-	returnURL := r.URL.RequestURI()
-	state := encodeState(returnURL, m.ClientSecret)
-	authURL := m.oidc.authURL(m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
+	state := encodeState(nonce, r.URL.RequestURI(), m.ClientSecret)
+	authURL, err := m.oidc.authURL(r.Context(), m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadGateway, err)
+	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     pkceCookieName,
+		Name:     pkceCookiePrefix + nonce,
 		Value:    verifier,
 		Path:     m.CallbackPath,
 		HttpOnly: true,
