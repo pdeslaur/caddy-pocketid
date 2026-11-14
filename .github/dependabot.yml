@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      all-actions:
+        patterns: ["*"]
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "auto-merge"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      all-go:
+        patterns: ["*"]
+    # Not auto-merged: module updates bring in code nobody here has read, so
+    # a person merges them. caddy-sso's build resolves the plugin's
+    # dependencies against Caddy's anyway, so they rarely matter there.
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
