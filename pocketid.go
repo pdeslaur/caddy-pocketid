@@ -29,17 +29,24 @@ const (
 // Middleware gates requests behind PocketID OIDC authentication.
 // Valid sessions are identified by an RS256 id_token stored in a cookie.
 type Middleware struct {
-	Issuer       string        `json:"issuer"`
-	ClientID     string        `json:"client_id"`
-	ClientSecret string        `json:"client_secret"`
-	CookieDomain string        `json:"cookie_domain,omitempty"`
-	CallbackPath string        `json:"callback_path,omitempty"`
-	Prompt       string        `json:"prompt,omitempty"`
-	Headers      []HeaderPair  `json:"headers,omitempty"`
-	ClaimHeaders []ClaimHeader `json:"claim_headers,omitempty"`
+	Issuer       string `json:"issuer"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	// ClientAssertion authenticates the client without a secret: "spiffe"
+	// sends a JWT-SVID from the SPIFFE Workload API, for the issuer as its
+	// audience.
+	ClientAssertion string        `json:"client_assertion,omitempty"`
+	CookieDomain    string        `json:"cookie_domain,omitempty"`
+	CallbackPath    string        `json:"callback_path,omitempty"`
+	Prompt          string        `json:"prompt,omitempty"`
+	Headers         []HeaderPair  `json:"headers,omitempty"`
+	ClaimHeaders    []ClaimHeader `json:"claim_headers,omitempty"`
 
-	oidc   *oidcProvider
-	logger *zap.Logger
+	oidc *oidcProvider
+	// stateKey signs the OAuth2 state: the client secret, or a random key
+	// without one, so a restart fails only the logins in flight.
+	stateKey string
+	logger   *zap.Logger
 }
 
 // HeaderPair is a static header injected into every authenticated request.
@@ -68,11 +75,25 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.ClientID == "" {
 		return fmt.Errorf("client_id is required")
 	}
-	if m.ClientSecret == "" {
-		return fmt.Errorf("client_secret is required")
+	switch m.ClientAssertion {
+	case "":
+	case "spiffe":
+		if m.ClientSecret != "" {
+			return fmt.Errorf("client_secret and client_assertion are exclusive")
+		}
+	default:
+		return fmt.Errorf("unknown client_assertion %q: only spiffe", m.ClientAssertion)
 	}
 	if m.CallbackPath == "" {
 		m.CallbackPath = "/auth/callback"
+	}
+	m.stateKey = m.ClientSecret
+	if m.stateKey == "" {
+		key, err := generateNonce()
+		if err != nil {
+			return fmt.Errorf("generating state key: %w", err)
+		}
+		m.stateKey = key
 	}
 
 	m.logger = ctx.Logger()
@@ -142,7 +163,7 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	state, err := verifyState(stateParam, m.ClientSecret)
+	state, err := verifyState(stateParam, m.stateKey)
 	if err != nil {
 		m.logger.Warn("invalid state in callback", zap.Error(err))
 		http.Error(w, "invalid state", http.StatusBadRequest)
@@ -155,8 +176,18 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
+	var assertion string
+	if m.ClientAssertion == "spiffe" {
+		assertion, err = fetchSVID(r.Context(), m.Issuer)
+		if err != nil {
+			m.logger.Error("client assertion unavailable", zap.Error(err))
+			http.Error(w, "client assertion unavailable", http.StatusBadGateway)
+			return nil
+		}
+	}
+
 	idToken, err := m.oidc.exchangeCode(r.Context(), code, verifierCookie.Value,
-		m.callbackURI(r), m.ClientID, m.ClientSecret)
+		m.callbackURI(r), m.ClientID, m.ClientSecret, assertion)
 	if err != nil {
 		m.logger.Error("token exchange failed", zap.Error(err))
 		http.Error(w, "token exchange failed", http.StatusInternalServerError)
@@ -204,7 +235,7 @@ func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) erro
 		return fmt.Errorf("generating nonce: %w", err)
 	}
 
-	state := encodeState(nonce, r.URL.RequestURI(), m.ClientSecret)
+	state := encodeState(nonce, r.URL.RequestURI(), m.stateKey)
 	authURL, err := m.oidc.authURL(r.Context(), m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
 	if err != nil {
 		return caddyhttp.Error(http.StatusBadGateway, err)
@@ -259,6 +290,11 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.ClientSecret = d.Val()
+		case "client_assertion":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.ClientAssertion = d.Val()
 		case "cookie_domain":
 			if !d.NextArg() {
 				return d.ArgErr()

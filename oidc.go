@@ -58,23 +58,34 @@ func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID str
 	return claims, nil
 }
 
-func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI, clientID, clientSecret string) (string, error) {
+// exchangeCode redeems an authorization code for an id_token. The client
+// authenticates with clientSecret, or with assertion, a JWT, when it has no
+// secret; with neither, it is a public client.
+func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI, clientID, clientSecret, assertion string) (string, error) {
 	provider, err := p.get(ctx)
 	if err != nil {
 		return "", err
 	}
+	endpoint := provider.Endpoint()
+	if clientSecret == "" {
+		// Only client_id goes in the body, never an empty Basic password.
+		endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
 	cfg := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Endpoint:     provider.Endpoint(),
+		Endpoint:     endpoint,
 		RedirectURL:  redirectURI,
 		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
 	}
-	token, err := cfg.Exchange(
-		oidc.ClientContext(ctx, oidcHTTPClient),
-		code,
-		oauth2.SetAuthURLParam("code_verifier", verifier),
-	)
+	opts := []oauth2.AuthCodeOption{oauth2.SetAuthURLParam("code_verifier", verifier)}
+	if assertion != "" {
+		opts = append(opts,
+			oauth2.SetAuthURLParam("client_assertion_type", clientAssertionType),
+			oauth2.SetAuthURLParam("client_assertion", assertion),
+		)
+	}
+	token, err := cfg.Exchange(oidc.ClientContext(ctx, oidcHTTPClient), code, opts...)
 	if err != nil {
 		return "", fmt.Errorf("token exchange: %w", err)
 	}
