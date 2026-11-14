@@ -6,11 +6,11 @@ require (
 	chainguard.dev/go-oidctest v0.4.0
 	github.com/caddyserver/caddy/v2 v2.11.9
 	github.com/coreos/go-oidc/v3 v3.21.0
-	github.com/go-jose/go-jose/v4 v4.1.6
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/spiffe/go-spiffe/v2 v2.9.0
 	go.uber.org/zap v1.28.0
-	golang.org/x/oauth2 v0.37.0
-	google.golang.org/grpc v1.83.2
+	golang.org/x/oauth2 v0.38.0
+	google.golang.org/grpc v1.85.0
 )
 
 require (
