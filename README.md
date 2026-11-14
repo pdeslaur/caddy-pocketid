@@ -92,13 +92,34 @@ example.com {
 
 See the [Caddy matcher documentation](https://caddyserver.com/docs/caddyfile/matchers) for the full list of available matchers.
 
+### Clients without a secret
+
+With `client_assertion spiffe` and no `client_secret`, each code exchange authenticates the client with a JWT-SVID (RFC 7523), fetched from the [SPIFFE Workload API](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/#spiffe-workload-api) at `SPIFFE_ENDPOINT_SOCKET` with the issuer as its audience. In PocketID, give the client a federated identity whose issuer is your SPIRE server's JWT issuer, whose subject is the workload's SPIFFE ID, and whose audience is the issuer URL here. A login fails with 502 when the Workload API can't be reached.
+
+```caddyfile
+example.com {
+    pocketid_auth {
+        issuer           https://id.example.com
+        client_id        {$POCKETID_CLIENT_ID}
+        client_assertion spiffe
+    }
+
+    reverse_proxy localhost:8080
+}
+```
+
+With neither `client_secret` nor `client_assertion`, the plugin is a public client, relying on PKCE alone.
+
+Without a secret, the OAuth2 state is signed with a random key made at startup, so restarting Caddy fails only the logins in flight.
+
 ## Configuration reference
 
 | Option | Required | Default | Description |
 |---|---|---|---|
 | `issuer` | Yes | — | Base URL of your PocketID instance (e.g. `https://id.example.com`). |
 | `client_id` | Yes | — | OAuth2 client ID registered in PocketID. |
-| `client_secret` | Yes | — | OAuth2 client secret. Use `{$VAR}` to avoid hardcoding. |
+| `client_secret` | No | — | OAuth2 client secret. Use `{$VAR}` to avoid hardcoding. Exclusive with `client_assertion`. |
+| `client_assertion` | No | — | `spiffe` authenticates the client with a JWT-SVID instead of a secret; see [Clients without a secret](#clients-without-a-secret). |
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
 | `prompt` | No | — | OIDC [`prompt` parameter](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) sent on every authorization request. Common values: `login` (force re-authentication), `consent` (force consent screen), `select_account`, `none`. |
