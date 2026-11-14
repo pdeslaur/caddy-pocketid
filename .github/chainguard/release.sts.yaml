@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.TrustPolicy.json
+# Allows CI's release job, running on main, to open release-please's pull
+# request so that it triggers CI, and to tag and create the release.
+issuer: https://token.actions.githubusercontent.com
+# GitHub names the owner and repository with their IDs in the subject.
+subject: repo:pdeslaur@1692704/caddy-pocketid@1269652890:ref:refs/heads/main
+claim_pattern:
+    event_name: push
+    job_workflow_ref: pdeslaur/caddy-pocketid/\.github/workflows/ci\.yml@refs/heads/main
+
+permissions:
+    contents: write
+    issues: write
+    pull_requests: write
