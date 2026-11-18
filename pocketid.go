@@ -1,18 +1,18 @@
 package pocketid
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/pdeslaur/caddy-pocketid/internal/issuer"
-	"github.com/pdeslaur/caddy-pocketid/internal/state"
+	"github.com/pdeslaur/caddy-pocketid/internal/session"
 	"go.uber.org/zap"
 )
 
@@ -22,20 +22,8 @@ func init() {
 	httpcaddyfile.RegisterDirectiveOrder("pocketid_auth", httpcaddyfile.Before, "basicauth")
 }
 
-const (
-	cookieName        = "pocketid_token"
-	refreshCookieName = "pocketid_refresh"
-	// refreshCookieMaxAge matches PocketID's default refresh token lifetime.
-	refreshCookieMaxAge = 30 * 24 * time.Hour
-	// pkceCookiePrefix is followed by the state nonce, giving each login flow
-	// its own verifier cookie.
-	pkceCookiePrefix = "pocketid_pkce_"
-)
-
-// Middleware gates requests behind PocketID OIDC authentication.
-// Valid sessions are identified by an RS256 id_token stored in a cookie.
-// With Refresh, a refresh token stored in a second cookie renews the id_token
-// once it has expired or its cookie is gone, without a redirect.
+// Middleware gates requests behind PocketID OIDC authentication, and injects
+// headers into the authenticated requests it passes on.
 type Middleware struct {
 	Issuer       string `json:"issuer"`
 	ClientID     string `json:"client_id"`
@@ -51,11 +39,8 @@ type Middleware struct {
 	Headers         []HeaderPair  `json:"headers,omitempty"`
 	ClaimHeaders    []ClaimHeader `json:"claim_headers,omitempty"`
 
-	issuer *issuer.Provider
-	// stateKey signs the OAuth2 state: the client secret, or a random key
-	// without one, so a restart fails only the logins in flight.
-	stateKey string
-	logger   *zap.Logger
+	session *session.Manager
+	logger  *zap.Logger
 }
 
 // HeaderPair is a static header injected into every authenticated request.
@@ -96,17 +81,25 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.CallbackPath == "" {
 		m.CallbackPath = "/auth/callback"
 	}
-	m.stateKey = m.ClientSecret
-	if m.stateKey == "" {
-		key, err := state.NewNonce()
-		if err != nil {
-			return fmt.Errorf("generating state key: %w", err)
-		}
-		m.stateKey = key
-	}
 
 	m.logger = ctx.Logger()
-	m.issuer = issuer.New(m.Issuer)
+	s, err := session.New(session.Config{
+		Issuer: m.Issuer,
+		Credentials: issuer.Credentials{
+			ClientID: m.ClientID,
+			Secret:   m.ClientSecret,
+			SPIFFE:   m.ClientAssertion == "spiffe",
+		},
+		CallbackPath: m.CallbackPath,
+		CookieDomain: m.CookieDomain,
+		Prompt:       m.Prompt,
+		Refresh:      m.Refresh,
+		Logger:       m.logger,
+	})
+	if err != nil {
+		return err
+	}
+	m.session = s
 	return nil
 }
 
@@ -121,62 +114,14 @@ func (m *Middleware) Validate() error {
 }
 
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if _, err := m.issuer.Discover(r.Context()); err != nil {
+	err := m.session.Handle(w, r, func(w http.ResponseWriter, r *http.Request, claims map[string]any) error {
+		return next.ServeHTTP(w, m.injectHeaders(r, claims))
+	})
+	if errors.Is(err, session.ErrIssuerUnavailable) {
 		m.logger.Error("OIDC provider unavailable", zap.Error(err))
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
-
-	if r.URL.Path == m.CallbackPath {
-		return m.handleCallback(w, r)
-	}
-
-	if cookie, err := r.Cookie(cookieName); err == nil {
-		claims, err := m.issuer.ValidateToken(r.Context(), cookie.Value, m.ClientID)
-		if err == nil {
-			return next.ServeHTTP(w, m.injectHeaders(r, claims))
-		}
-		m.logger.Debug("rejecting token cookie", zap.Error(err))
-	}
-
-	if m.Refresh {
-		if claims, ok := m.refreshSession(w, r); ok {
-			return next.ServeHTTP(w, m.injectHeaders(r, claims))
-		}
-	}
-
-	return m.redirectToAuth(w, r)
-}
-
-// refreshSession renews the session from the refresh token cookie, setting
-// both cookies again, since PocketID rotates the refresh token. A rejected
-// refresh token is cleared, so the next request doesn't try it again.
-func (m *Middleware) refreshSession(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
-	cookie, err := r.Cookie(refreshCookieName)
-	if err != nil {
-		return nil, false
-	}
-	auth, err := m.clientAuth(r)
-	if err != nil {
-		m.logger.Error("client assertion unavailable", zap.Error(err))
-		return nil, false
-	}
-	t, err := m.issuer.Refresh(r.Context(), cookie.Value, auth)
-	if err != nil {
-		m.logger.Info("refresh failed", zap.Error(err))
-		m.clearRefreshCookie(w)
-		return nil, false
-	}
-	claims, err := m.issuer.ValidateToken(r.Context(), t.IDToken, m.ClientID)
-	if err != nil {
-		m.logger.Error("refreshed id_token validation failed", zap.Error(err))
-		m.clearRefreshCookie(w)
-		return nil, false
-	}
-	if t.RefreshToken == "" {
-		t.RefreshToken = cookie.Value
-	}
-	m.setSessionCookies(w, r, t)
-	return claims, true
+	return err
 }
 
 // injectHeaders clones the request, removes the session cookies, and sets
@@ -185,7 +130,7 @@ func (m *Middleware) refreshSession(w http.ResponseWriter, r *http.Request) (map
 // claim is absent from the token.
 func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http.Request {
 	r = r.Clone(r.Context())
-	stripSessionCookies(r.Header)
+	session.StripCookies(r.Header)
 	for _, h := range m.Headers {
 		r.Header.Set(h.Key, h.Value)
 	}
@@ -196,181 +141,6 @@ func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http
 		}
 	}
 	return r
-}
-
-// stripSessionCookies removes the session cookies from the Cookie headers, so
-// the backend never sees the tokens, leaving the others as they were sent.
-func stripSessionCookies(h http.Header) {
-	var kept []string
-	for _, line := range h.Values("Cookie") {
-		var parts []string
-		for part := range strings.SplitSeq(line, ";") {
-			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
-			if name == cookieName || name == refreshCookieName {
-				continue
-			}
-			parts = append(parts, strings.TrimSpace(part))
-		}
-		if len(parts) > 0 {
-			kept = append(kept, strings.Join(parts, "; "))
-		}
-	}
-	h.Del("Cookie")
-	for _, line := range kept {
-		h.Add("Cookie", line)
-	}
-}
-
-func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) error {
-	code := r.URL.Query().Get("code")
-	stateParam := r.URL.Query().Get("state")
-
-	if errParam := r.URL.Query().Get("error"); errParam != "" {
-		m.logger.Warn("auth error from provider", zap.String("error", errParam),
-			zap.String("description", r.URL.Query().Get("error_description")))
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
-		return nil
-	}
-
-	payload, err := state.Verify(stateParam, m.stateKey)
-	if err != nil {
-		m.logger.Warn("invalid state in callback", zap.Error(err))
-		http.Error(w, "invalid state", http.StatusBadRequest)
-		return nil
-	}
-
-	verifierCookie, err := r.Cookie(pkceCookiePrefix + payload.Nonce)
-	if err != nil {
-		http.Error(w, "missing pkce cookie", http.StatusBadRequest)
-		return nil
-	}
-
-	auth, err := m.clientAuth(r)
-	if err != nil {
-		m.logger.Error("client assertion unavailable", zap.Error(err))
-		http.Error(w, "client assertion unavailable", http.StatusBadGateway)
-		return nil
-	}
-
-	t, err := m.issuer.ExchangeCode(r.Context(), code, verifierCookie.Value, m.callbackURI(r), auth)
-	if err != nil {
-		m.logger.Error("token exchange failed", zap.Error(err))
-		http.Error(w, "token exchange failed", http.StatusInternalServerError)
-		return nil
-	}
-
-	if _, err := m.issuer.ValidateToken(r.Context(), t.IDToken, m.ClientID); err != nil {
-		m.logger.Error("id_token validation failed", zap.Error(err))
-		http.Error(w, "invalid id_token", http.StatusBadGateway)
-		return nil
-	}
-
-	m.setSessionCookies(w, r, t)
-
-	http.SetCookie(w, &http.Cookie{
-		Name:   verifierCookie.Name,
-		Value:  "",
-		Path:   m.CallbackPath,
-		MaxAge: -1,
-	})
-
-	http.Redirect(w, r, payload.ReturnURL, http.StatusFound)
-	return nil
-}
-
-// clientAuth returns how the client authenticates to the token endpoint,
-// fetching a JWT-SVID with client_assertion spiffe.
-func (m *Middleware) clientAuth(r *http.Request) (issuer.ClientAuth, error) {
-	auth := issuer.ClientAuth{ClientID: m.ClientID, Secret: m.ClientSecret}
-	if m.ClientAssertion == "spiffe" {
-		assertion, err := issuer.FetchSVID(r.Context(), m.Issuer)
-		if err != nil {
-			return issuer.ClientAuth{}, err
-		}
-		auth.Assertion = assertion
-	}
-	return auth, nil
-}
-
-// setSessionCookies stores the id_token and, with Refresh, the refresh token.
-func (m *Middleware) setSessionCookies(w http.ResponseWriter, r *http.Request, t issuer.Tokens) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    t.IDToken,
-		Domain:   m.cookieDomain(),
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-	})
-	if !m.Refresh || t.RefreshToken == "" {
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     refreshCookieName,
-		Value:    t.RefreshToken,
-		Domain:   m.cookieDomain(),
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(refreshCookieMaxAge.Seconds()),
-	})
-}
-
-func (m *Middleware) clearRefreshCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:   refreshCookieName,
-		Value:  "",
-		Domain: m.cookieDomain(),
-		Path:   "/",
-		MaxAge: -1,
-	})
-}
-
-func (m *Middleware) cookieDomain() string {
-	if m.CookieDomain == "" {
-		return ""
-	}
-	return "." + m.CookieDomain
-}
-
-func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) error {
-	verifier, challenge, err := issuer.GeneratePKCE()
-	if err != nil {
-		return fmt.Errorf("generating PKCE: %w", err)
-	}
-	nonce, err := state.NewNonce()
-	if err != nil {
-		return fmt.Errorf("generating nonce: %w", err)
-	}
-
-	st := state.Encode(nonce, r.URL.RequestURI(), m.stateKey)
-	authURL, err := m.issuer.AuthURL(r.Context(), m.ClientID, m.callbackURI(r), st, challenge, m.Prompt)
-	if err != nil {
-		return caddyhttp.Error(http.StatusBadGateway, err)
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     pkceCookiePrefix + nonce,
-		Value:    verifier,
-		Path:     m.CallbackPath,
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   300,
-	})
-
-	http.Redirect(w, r, authURL, http.StatusFound)
-	return nil
-}
-
-func (m *Middleware) callbackURI(r *http.Request) string {
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	return scheme + "://" + r.Host + m.CallbackPath
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {

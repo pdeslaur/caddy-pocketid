@@ -5,6 +5,7 @@ package issuer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +18,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// HTTPClient sends every request to the issuer.
-var HTTPClient = &http.Client{Timeout: 10 * time.Second}
+// httpClient sends every request to the issuer.
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // Provider performs OIDC discovery lazily on first use, so Caddy can start
 // even when the issuer is unreachable (e.g. PocketID is served by the same
@@ -42,7 +43,7 @@ func (p *Provider) Discover(ctx context.Context) (*oidc.Provider, error) {
 	if p.provider != nil {
 		return p.provider, nil
 	}
-	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, HTTPClient), p.issuer)
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, httpClient), p.issuer)
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery: %w", err)
 	}
@@ -57,7 +58,7 @@ func (p *Provider) ValidateToken(ctx context.Context, tokenStr, clientID string)
 		return nil, err
 	}
 	verifier := provider.Verifier(&oidc.Config{ClientID: clientID})
-	idToken, err := verifier.Verify(oidc.ClientContext(ctx, HTTPClient), tokenStr)
+	idToken, err := verifier.Verify(oidc.ClientContext(ctx, httpClient), tokenStr)
 	if err != nil {
 		return nil, err
 	}
@@ -75,47 +76,55 @@ type Tokens struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// ClientAuth is how the client authenticates to the token endpoint: with its
-// Secret, or with Assertion, a JWT, when it has no secret; with neither, it is
-// a public client.
-type ClientAuth struct {
-	ClientID  string
-	Secret    string
-	Assertion string
+// Credentials are how the client authenticates to the token endpoint: with
+// Secret, or with SPIFFE, a JWT-SVID for the issuer as its audience, when it
+// has no secret; with neither, it is a public client.
+type Credentials struct {
+	ClientID string
+	Secret   string
+	SPIFFE   bool
 }
 
+// ErrClientAssertion is returned, wrapped, when the client assertion can't be
+// fetched; no token request is sent then.
+var ErrClientAssertion = errors.New("client assertion unavailable")
+
 // ExchangeCode redeems an authorization code for tokens.
-func (p *Provider) ExchangeCode(ctx context.Context, code, verifier, redirectURI string, auth ClientAuth) (Tokens, error) {
+func (p *Provider) ExchangeCode(ctx context.Context, code, verifier, redirectURI string, creds Credentials) (Tokens, error) {
 	return p.requestTokens(ctx, url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"code_verifier": {verifier},
 		"redirect_uri":  {redirectURI},
-	}, auth)
+	}, creds)
 }
 
 // Refresh redeems a refresh token for tokens.
-func (p *Provider) Refresh(ctx context.Context, refreshToken string, auth ClientAuth) (Tokens, error) {
+func (p *Provider) Refresh(ctx context.Context, refreshToken string, creds Credentials) (Tokens, error) {
 	return p.requestTokens(ctx, url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
-	}, auth)
+	}, creds)
 }
 
 // requestTokens posts form to the token endpoint and returns the tokens,
 // which always include an id_token.
-func (p *Provider) requestTokens(ctx context.Context, form url.Values, auth ClientAuth) (Tokens, error) {
+func (p *Provider) requestTokens(ctx context.Context, form url.Values, creds Credentials) (Tokens, error) {
 	provider, err := p.Discover(ctx)
 	if err != nil {
 		return Tokens{}, err
 	}
-	if auth.Secret == "" {
+	if creds.Secret == "" {
 		// Only client_id goes in the body, never an empty Basic password.
-		form.Set("client_id", auth.ClientID)
+		form.Set("client_id", creds.ClientID)
 	}
-	if auth.Assertion != "" {
-		form.Set("client_assertion_type", ClientAssertionType)
-		form.Set("client_assertion", auth.Assertion)
+	if creds.SPIFFE {
+		svid, err := fetchSVID(ctx, p.issuer)
+		if err != nil {
+			return Tokens{}, fmt.Errorf("%w: %w", ErrClientAssertion, err)
+		}
+		form.Set("client_assertion_type", clientAssertionType)
+		form.Set("client_assertion", svid)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint().TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -123,12 +132,12 @@ func (p *Provider) requestTokens(ctx context.Context, form url.Values, auth Clie
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	if auth.Secret != "" {
+	if creds.Secret != "" {
 		// RFC 6749 section 2.3.1: both are form-encoded before Basic encoding.
-		req.SetBasicAuth(url.QueryEscape(auth.ClientID), url.QueryEscape(auth.Secret))
+		req.SetBasicAuth(url.QueryEscape(creds.ClientID), url.QueryEscape(creds.Secret))
 	}
 
-	resp, err := HTTPClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Tokens{}, fmt.Errorf("token request: %w", err)
 	}

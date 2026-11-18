@@ -1,4 +1,4 @@
-package pocketid
+package session
 
 import (
 	"crypto/rand"
@@ -7,28 +7,35 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/pdeslaur/caddy-pocketid/internal/state"
 )
 
+// tokenRequest is what a client sent to the token endpoint.
+type tokenRequest struct {
+	form          url.Values
+	authorization string
+}
+
 // refreshIssuer is a fake OIDC issuer whose token endpoint redeems any
 // authorization code and rotates refresh tokens, like PocketID: each refresh
-// token can be redeemed once.
+// token can be redeemed once. It records the token requests it receives.
 type refreshIssuer struct {
 	*httptest.Server
 	signer jose.Signer
 
-	mu     sync.Mutex
-	active map[string]bool
-	issued int
+	mu       sync.Mutex
+	active   map[string]bool
+	issued   int
+	requests []tokenRequest
 }
 
 func newRefreshIssuer(t *testing.T) *refreshIssuer {
@@ -63,29 +70,31 @@ func newRefreshIssuer(t *testing.T) *refreshIssuer {
 }
 
 func (iss *refreshIssuer) token(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	iss.mu.Lock()
 	defer iss.mu.Unlock()
-	switch r.FormValue("grant_type") {
+	iss.requests = append(iss.requests, tokenRequest{form: r.PostForm, authorization: r.Header.Get("Authorization")})
+	switch r.PostForm.Get("grant_type") {
 	case "authorization_code":
 	case "refresh_token":
-		if !iss.active[r.FormValue("refresh_token")] {
+		if !iss.active[r.PostForm.Get("refresh_token")] {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = fmt.Fprint(w, `{"error":"invalid_grant"}`)
 			return
 		}
-		delete(iss.active, r.FormValue("refresh_token"))
+		delete(iss.active, r.PostForm.Get("refresh_token"))
 	default:
 		http.Error(w, "unsupported grant_type", http.StatusBadRequest)
 		return
 	}
-	iss.issued++
-	refreshToken := fmt.Sprintf("refresh-%d", iss.issued)
-	iss.active[refreshToken] = true
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"id_token":      iss.idToken(time.Now().Add(time.Hour)),
-		"refresh_token": refreshToken,
+		"refresh_token": iss.newRefreshTokenLocked(),
 		"access_token":  "unused",
 		"token_type":    "Bearer",
 	})
@@ -110,27 +119,23 @@ func (iss *refreshIssuer) idToken(expiry time.Time) string {
 func (iss *refreshIssuer) issueRefreshToken() string {
 	iss.mu.Lock()
 	defer iss.mu.Unlock()
+	return iss.newRefreshTokenLocked()
+}
+
+func (iss *refreshIssuer) newRefreshTokenLocked() string {
 	iss.issued++
 	token := fmt.Sprintf("refresh-%d", iss.issued)
 	iss.active[token] = true
 	return token
 }
 
-func newRefreshMiddleware(t *testing.T, iss *refreshIssuer) *Middleware {
-	t.Helper()
-	m := newTestMiddleware(t, iss.URL)
-	m.Refresh = true
-	return m
+func (iss *refreshIssuer) received() []tokenRequest {
+	iss.mu.Lock()
+	defer iss.mu.Unlock()
+	return slices.Clone(iss.requests)
 }
 
-func responseCookie(w *httptest.ResponseRecorder, name string) *http.Cookie {
-	for _, c := range w.Result().Cookies() {
-		if c.Name == name {
-			return c
-		}
-	}
-	return nil
-}
+func withRefresh(c *Config) { c.Refresh = true }
 
 // TestRefreshRenewsSession checks that a session whose id_token has expired,
 // or whose id_token cookie is gone, is renewed from the refresh token without
@@ -145,35 +150,33 @@ func TestRefreshRenewsSession(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			iss := newRefreshIssuer(t)
-			m := newRefreshMiddleware(t, iss)
-			requests := recordTokenRequests(t)
+			m := newTestManager(t, iss.URL, withRefresh)
 			refreshToken := iss.issueRefreshToken()
 
-			var gotSub string
-			m.ClaimHeaders = []ClaimHeader{{Claim: "sub", Header: "X-Remote-User"}}
-			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-				gotSub = r.Header.Get("X-Remote-User")
+			var gotSub any
+			next := func(w http.ResponseWriter, r *http.Request, claims map[string]any) error {
+				gotSub = claims["sub"]
 				return nil
-			})
+			}
 
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
 			if tt.idTokenCookie {
-				r.AddCookie(&http.Cookie{Name: cookieName, Value: iss.idToken(time.Now().Add(-time.Minute))})
+				r.AddCookie(&http.Cookie{Name: TokenCookie, Value: iss.idToken(time.Now().Add(-time.Minute))})
 			}
-			r.AddCookie(&http.Cookie{Name: refreshCookieName, Value: refreshToken})
+			r.AddCookie(&http.Cookie{Name: RefreshCookie, Value: refreshToken})
 
-			if err := m.ServeHTTP(w, r, next); err != nil {
-				t.Fatalf("ServeHTTP: %v", err)
+			if err := m.Handle(w, r, next); err != nil {
+				t.Fatalf("Handle: %v", err)
 			}
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", w.Code)
 			}
 			if gotSub != "test-subject" {
-				t.Errorf("X-Remote-User = %q, want test-subject", gotSub)
+				t.Errorf("backend got sub %v, want test-subject", gotSub)
 			}
 
-			got := requests()
+			got := iss.received()
 			if len(got) != 1 {
 				t.Fatalf("got %d token requests, want 1", len(got))
 			}
@@ -187,21 +190,21 @@ func TestRefreshRenewsSession(t *testing.T) {
 				t.Errorf("refresh not authenticated with the client secret")
 			}
 
-			idCookie := responseCookie(w, cookieName)
+			idCookie := responseCookie(w, TokenCookie)
 			if idCookie == nil {
 				t.Fatal("id_token cookie not set")
 			}
-			if _, err := m.issuer.ValidateToken(t.Context(), idCookie.Value, m.ClientID); err != nil {
+			if _, err := m.issuer.ValidateToken(t.Context(), idCookie.Value, "test-client"); err != nil {
 				t.Errorf("id_token cookie invalid: %v", err)
 			}
-			refreshCookie := responseCookie(w, refreshCookieName)
+			refreshCookie := responseCookie(w, RefreshCookie)
 			if refreshCookie == nil {
 				t.Fatal("refresh cookie not set")
 			}
 			if refreshCookie.Value == refreshToken {
 				t.Error("refresh cookie not rotated")
 			}
-			if want := int(refreshCookieMaxAge.Seconds()); refreshCookie.MaxAge != want {
+			if want := int(RefreshCookieMaxAge.Seconds()); refreshCookie.MaxAge != want {
 				t.Errorf("refresh cookie MaxAge = %d, want %d", refreshCookie.MaxAge, want)
 			}
 		})
@@ -212,123 +215,70 @@ func TestRefreshRenewsSession(t *testing.T) {
 // a login redirect and is cleared.
 func TestRefreshRejected(t *testing.T) {
 	iss := newRefreshIssuer(t)
-	m := newRefreshMiddleware(t, iss)
-
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		t.Error("backend reached with a rejected refresh token")
-		return nil
-	})
+	m := newTestManager(t, iss.URL, withRefresh)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: refreshCookieName, Value: "revoked"})
+	r.AddCookie(&http.Cookie{Name: RefreshCookie, Value: "revoked"})
 
-	if err := m.ServeHTTP(w, r, next); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
+	if err := m.Handle(w, r, failNext(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
 	if w.Code != http.StatusFound {
 		t.Errorf("status = %d, want 302", w.Code)
 	}
-	c := responseCookie(w, refreshCookieName)
+	c := responseCookie(w, RefreshCookie)
 	if c == nil || c.MaxAge >= 0 {
 		t.Errorf("refresh cookie not cleared: %v", c)
 	}
 }
 
-// TestRefreshDisabled checks that without refresh, a refresh token cookie is
+// TestRefreshDisabled checks that without Refresh, a refresh token cookie is
 // ignored.
 func TestRefreshDisabled(t *testing.T) {
 	iss := newRefreshIssuer(t)
-	m := newTestMiddleware(t, iss.URL)
-	requests := recordTokenRequests(t)
+	m := newTestManager(t, iss.URL)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: refreshCookieName, Value: iss.issueRefreshToken()})
+	r.AddCookie(&http.Cookie{Name: RefreshCookie, Value: iss.issueRefreshToken()})
 
-	if err := m.ServeHTTP(w, r, nopNext); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
+	if err := m.Handle(w, r, failNext(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
 	if w.Code != http.StatusFound {
 		t.Errorf("status = %d, want 302", w.Code)
 	}
-	if got := requests(); len(got) != 0 {
+	if got := iss.received(); len(got) != 0 {
 		t.Errorf("got %d token requests, want none", len(got))
 	}
 }
 
 // TestCallbackStoresRefreshToken checks that the callback stores the refresh
-// token only with refresh.
+// token only with Refresh.
 func TestCallbackStoresRefreshToken(t *testing.T) {
 	for _, refresh := range []bool{true, false} {
 		t.Run(fmt.Sprintf("refresh=%v", refresh), func(t *testing.T) {
 			iss := newRefreshIssuer(t)
-			m := newTestMiddleware(t, iss.URL)
-			m.Refresh = refresh
+			m := newTestManager(t, iss.URL, func(c *Config) { c.Refresh = refresh })
 
 			st := state.Encode("nonce", "/dashboard", m.stateKey)
 			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+st, nil)
+			r := httptest.NewRequest(http.MethodGet, testCallbackPath+"?code=abc&state="+st, nil)
 			r.AddCookie(&http.Cookie{Name: pkceCookiePrefix + "nonce", Value: "verifier"})
 
-			if err := m.ServeHTTP(w, r, nopNext); err != nil {
-				t.Fatalf("ServeHTTP: %v", err)
+			if err := m.Handle(w, r, failNext(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
 			}
 			if w.Code != http.StatusFound {
 				t.Fatalf("status = %d, want 302", w.Code)
 			}
-			if responseCookie(w, cookieName) == nil {
+			if responseCookie(w, TokenCookie) == nil {
 				t.Error("id_token cookie not set")
 			}
-			if got := responseCookie(w, refreshCookieName) != nil; got != refresh {
+			if got := responseCookie(w, RefreshCookie) != nil; got != refresh {
 				t.Errorf("refresh cookie set: %v, want %v", got, refresh)
 			}
 		})
-	}
-}
-
-// TestSessionCookiesNotForwarded checks that the backend never sees the
-// session cookies, and sees every other cookie as it was sent.
-func TestSessionCookiesNotForwarded(t *testing.T) {
-	iss := newRefreshIssuer(t)
-	m := newRefreshMiddleware(t, iss)
-
-	var gotCookies []string
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		gotCookies = r.Header.Values("Cookie")
-		return nil
-	})
-
-	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.Header.Add("Cookie", "theme=dark; "+cookieName+"="+iss.idToken(time.Now().Add(time.Hour))+"; lang=fr")
-	r.Header.Add("Cookie", refreshCookieName+"="+iss.issueRefreshToken())
-
-	if err := m.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if want := []string{"theme=dark; lang=fr"}; strings.Join(gotCookies, "|") != strings.Join(want, "|") {
-		t.Errorf("Cookie = %q, want %q", gotCookies, want)
-	}
-}
-
-func TestUnmarshalCaddyfileRefresh(t *testing.T) {
-	var m Middleware
-	d := caddyfile.NewTestDispenser(`pocketid_auth {
-		issuer https://id.example.com
-		client_id test-client
-		refresh
-	}`)
-	if err := m.UnmarshalCaddyfile(d); err != nil {
-		t.Fatalf("UnmarshalCaddyfile: %v", err)
-	}
-	if !m.Refresh {
-		t.Error("refresh not enabled")
-	}
-
-	d = caddyfile.NewTestDispenser(`pocketid_auth {
-		refresh yes
-	}`)
-	if err := (&Middleware{}).UnmarshalCaddyfile(d); err == nil {
-		t.Error("refresh with an argument: want error")
 	}
 }

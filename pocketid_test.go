@@ -1,13 +1,13 @@
 package pocketid
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,9 +15,10 @@ import (
 
 	"chainguard.dev/go-oidctest/pkg/oidctest"
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/go-jose/go-jose/v4/jwt"
-	"github.com/pdeslaur/caddy-pocketid/internal/state"
+	"github.com/pdeslaur/caddy-pocketid/internal/session"
 )
 
 // newTestMiddleware provisions a Middleware against a fake OIDC issuer
@@ -106,83 +107,13 @@ func TestOIDCFullFlow(t *testing.T) {
 	srvURL, _ := url.Parse(srv.URL)
 	var hasSessionCookie bool
 	for _, c := range jar.Cookies(srvURL) {
-		if c.Name == cookieName {
+		if c.Name == session.TokenCookie {
 			hasSessionCookie = true
 			break
 		}
 	}
 	if !hasSessionCookie {
 		t.Error("session cookie not set: OIDC flow did not complete")
-	}
-}
-
-// TestOIDCFullFlowPreservesReturnURL checks that after the OIDC dance the user
-// lands on the original URL (including query string), not just /.
-func TestOIDCFullFlowPreservesReturnURL(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	var gotPath string
-	srv := httptest.NewTLSServer(serveMiddleware(m, func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.RequestURI()
-		_, _ = fmt.Fprintln(w, "ok")
-	}))
-	t.Cleanup(srv.Close)
-
-	jar, _ := cookiejar.New(nil)
-	client := srv.Client()
-	client.Jar = jar
-
-	resp, err := client.Get(srv.URL + "/app/page?ref=123")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if gotPath != "/app/page?ref=123" {
-		t.Errorf("landed on %q, want /app/page?ref=123", gotPath)
-	}
-}
-
-// TestOIDCAlreadyAuthenticated checks that a request carrying a valid session
-// cookie reaches the backend without triggering a redirect.
-func TestOIDCAlreadyAuthenticated(t *testing.T) {
-	signer, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	token, err := jwt.Signed(signer).Claims(jwt.Claims{
-		Issuer:   issuerURL,
-		IssuedAt: jwt.NewNumericDate(time.Now()),
-		Expiry:   jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
-		Subject:  "test-subject",
-		Audience: jwt.Audience{"test-client"},
-	}).Serialize()
-	if err != nil {
-		t.Fatalf("Serialize: %v", err)
-	}
-
-	var backendHit bool
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		backendHit = true
-		w.WriteHeader(http.StatusOK)
-		return nil
-	})
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
-
-	if err := m.ServeHTTP(w, r, next); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if !backendHit {
-		t.Error("backend not reached with valid session cookie")
-	}
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", w.Code)
 	}
 }
 
@@ -215,7 +146,7 @@ func TestSetHeader(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	r.AddCookie(&http.Cookie{Name: session.TokenCookie, Value: token})
 
 	if err := m.ServeHTTP(w, r, next); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
@@ -264,7 +195,7 @@ func TestForwardClaim(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	r.AddCookie(&http.Cookie{Name: session.TokenCookie, Value: token})
 
 	if err := m.ServeHTTP(w, r, next); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
@@ -308,106 +239,6 @@ func TestHeadersNotInjectedWhenUnauthenticated(t *testing.T) {
 	}
 }
 
-// TestOIDCExpiredToken checks that an expired session cookie triggers a redirect
-// to re-authenticate rather than passing through.
-func TestOIDCExpiredToken(t *testing.T) {
-	signer, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	expired, err := jwt.Signed(signer).Claims(jwt.Claims{
-		Issuer:   issuerURL,
-		IssuedAt: jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
-		Expiry:   jwt.NewNumericDate(time.Now().Add(-1 * time.Hour)),
-		Subject:  "test-subject",
-		Audience: jwt.Audience{"test-client"},
-	}).Serialize()
-	if err != nil {
-		t.Fatalf("Serialize: %v", err)
-	}
-
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		t.Error("backend should not be reached with expired token")
-		return nil
-	})
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
-	r.AddCookie(&http.Cookie{Name: cookieName, Value: expired})
-
-	if err := m.ServeHTTP(w, r, next); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if w.Code != http.StatusFound {
-		t.Errorf("status = %d, want 302", w.Code)
-	}
-}
-
-// TestOIDCCallbackAuthError checks that a provider error in the callback
-// (e.g. user denied consent) returns 401.
-func TestOIDCCallbackAuthError(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/auth/callback?error=access_denied&error_description=user+denied", nil)
-
-	if err := m.ServeHTTP(w, r, nopNext); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", w.Code)
-	}
-}
-
-// TestOIDCCallbackInvalidState checks that a tampered or missing state returns 400.
-func TestOIDCCallbackInvalidState(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state=tampered.invalidsig", nil)
-
-	if err := m.ServeHTTP(w, r, nopNext); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", w.Code)
-	}
-}
-
-// TestOIDCCallbackMissingPKCECookie checks that a callback with a valid state
-// but no PKCE verifier cookie returns 400.
-func TestOIDCCallbackMissingPKCECookie(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	st := state.Encode("nonce", "/dashboard", m.ClientSecret)
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+st, nil)
-
-	if err := m.ServeHTTP(w, r, nopNext); err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
-	}
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", w.Code)
-	}
-}
-
-func TestCallbackURIScheme(t *testing.T) {
-	m := &Middleware{CallbackPath: "/auth/callback"}
-
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.Host = "example.com"
-	if got := m.callbackURI(r); got != "http://example.com/auth/callback" {
-		t.Errorf("plain request: got %q", got)
-	}
-
-	r.TLS = &tls.ConnectionState{}
-	if got := m.callbackURI(r); got != "https://example.com/auth/callback" {
-		t.Errorf("TLS request: got %q", got)
-	}
-}
-
 // TestForwardClaimStripsClientHeader checks that a client-supplied header named
 // by forward_claim never reaches the backend when the token lacks that claim.
 func TestForwardClaimStripsClientHeader(t *testing.T) {
@@ -435,101 +266,13 @@ func TestForwardClaimStripsClientHeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
 	r.Header.Set("X-Remote-Email", "admin@example.com")
-	r.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	r.AddCookie(&http.Cookie{Name: session.TokenCookie, Value: token})
 
 	if err := m.ServeHTTP(w, r, next); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
 	}
 	if len(gotEmail) != 0 {
 		t.Errorf("X-Remote-Email = %q, want absent", gotEmail)
-	}
-}
-
-// TestOIDCFullFlowClearsPKCECookie checks that the PKCE verifier cookie is
-// removed once the callback completes.
-func TestOIDCFullFlowClearsPKCECookie(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	srv := httptest.NewTLSServer(serveMiddleware(m, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, "ok")
-	}))
-	t.Cleanup(srv.Close)
-
-	jar, _ := cookiejar.New(nil)
-	client := srv.Client()
-	client.Jar = jar
-
-	resp, err := client.Get(srv.URL + "/dashboard")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	callbackURL, _ := url.Parse(srv.URL + m.CallbackPath)
-	for _, c := range jar.Cookies(callbackURL) {
-		if strings.HasPrefix(c.Name, pkceCookiePrefix) {
-			t.Errorf("PKCE cookie %q still present after callback", c.Name)
-		}
-	}
-}
-
-// TestOIDCConcurrentFlows checks that starting a second login flow in the same
-// browser does not break one already in progress.
-func TestOIDCConcurrentFlows(t *testing.T) {
-	_, issuerURL := oidctest.NewIssuer(t)
-	m := newTestMiddleware(t, issuerURL)
-
-	var gotPath string
-	srv := httptest.NewTLSServer(serveMiddleware(m, func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.RequestURI()
-		_, _ = fmt.Fprintln(w, "ok")
-	}))
-	t.Cleanup(srv.Close)
-
-	jar, _ := cookiejar.New(nil)
-	noFollowClient := srv.Client()
-	noFollowClient.Jar = jar
-	noFollowClient.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	startFlow := func(path string) string {
-		t.Helper()
-		resp, err := noFollowClient.Get(srv.URL + path)
-		if err != nil {
-			t.Fatalf("GET %s: %v", path, err)
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusFound {
-			t.Fatalf("GET %s: status = %d, want 302", path, resp.StatusCode)
-		}
-		return resp.Header.Get("Location")
-	}
-	first := startFlow("/first")
-	second := startFlow("/second")
-
-	client := srv.Client()
-	client.Jar = jar
-	client.CheckRedirect = nil
-	for _, tc := range []struct{ authURL, wantPath string }{
-		{first, "/first"},
-		{second, "/second"},
-	} {
-		resp, err := client.Get(tc.authURL)
-		if err != nil {
-			t.Fatalf("completing flow for %s: %v", tc.wantPath, err)
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("flow for %s: status = %d, want 200", tc.wantPath, resp.StatusCode)
-		}
-		if gotPath != tc.wantPath {
-			t.Errorf("flow for %s: landed on %q", tc.wantPath, gotPath)
-		}
 	}
 }
 
@@ -570,5 +313,116 @@ func TestProvisionIssuerUnavailable(t *testing.T) {
 	}
 	if loc := w.Header().Get("Location"); !strings.HasPrefix(loc, issuer.URL+"/authorize") {
 		t.Errorf("Location = %q, want prefix %s/authorize", loc, issuer.URL)
+	}
+}
+
+// TestSessionCookiesNotForwarded checks that the backend never sees the
+// session cookies, and sees every other cookie as it was sent.
+func TestSessionCookiesNotForwarded(t *testing.T) {
+	signer, issuerURL := oidctest.NewIssuer(t)
+	m := newTestMiddleware(t, issuerURL)
+
+	token, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer:   issuerURL,
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+		Expiry:   jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
+		Subject:  "user-123",
+		Audience: jwt.Audience{"test-client"},
+	}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+
+	var gotCookies []string
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		gotCookies = r.Header.Values("Cookie")
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	r.Header.Add("Cookie", "theme=dark; "+session.TokenCookie+"="+token+"; lang=fr")
+	r.Header.Add("Cookie", session.RefreshCookie+"=refresh")
+
+	if err := m.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if want := []string{"theme=dark; lang=fr"}; strings.Join(gotCookies, "|") != strings.Join(want, "|") {
+		t.Errorf("Cookie = %q, want %q", gotCookies, want)
+	}
+}
+
+func TestProvisionClientAuthentication(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		secret    string
+		assertion string
+		wantErr   bool
+	}{
+		{name: "secret", secret: "s"},
+		{name: "spiffe", assertion: "spiffe"},
+		{name: "public"},
+		{name: "both", secret: "s", assertion: "spiffe", wantErr: true},
+		{name: "unknown assertion", assertion: "kerberos", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Middleware{
+				Issuer:          "https://id.example.com",
+				ClientID:        "test-client",
+				ClientSecret:    tt.secret,
+				ClientAssertion: tt.assertion,
+			}
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
+			t.Cleanup(cancel)
+			if err := m.Provision(ctx); (err != nil) != tt.wantErr {
+				t.Errorf("Provision: %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestUnmarshalCaddyfile(t *testing.T) {
+	var m Middleware
+	d := caddyfile.NewTestDispenser(`pocketid_auth {
+		issuer https://id.example.com
+		client_id test-client
+		client_secret test-secret
+		client_assertion spiffe
+		cookie_domain example.com
+		callback_path /cb
+		prompt login
+		refresh
+		set_header X-Auth-Source pocketid
+		forward_claim email X-Remote-Email
+	}`)
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	want := Middleware{
+		Issuer:          "https://id.example.com",
+		ClientID:        "test-client",
+		ClientSecret:    "test-secret",
+		ClientAssertion: "spiffe",
+		CookieDomain:    "example.com",
+		CallbackPath:    "/cb",
+		Prompt:          "login",
+		Refresh:         true,
+		Headers:         []HeaderPair{{Key: "X-Auth-Source", Value: "pocketid"}},
+		ClaimHeaders:    []ClaimHeader{{Claim: "email", Header: "X-Remote-Email"}},
+	}
+	if !reflect.DeepEqual(m, want) {
+		t.Errorf("got %+v, want %+v", m, want)
+	}
+
+	for _, bad := range []string{
+		"refresh yes",
+		"issuer",
+		"set_header X-Only-Key",
+		"forward_claim email",
+		"unknown value",
+	} {
+		d := caddyfile.NewTestDispenser("pocketid_auth {\n" + bad + "\n}")
+		if err := (&Middleware{}).UnmarshalCaddyfile(d); err == nil {
+			t.Errorf("%q: want error", bad)
+		}
 	}
 }
