@@ -2,8 +2,12 @@ package pocketid
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,42 +62,92 @@ func (p *oidcProvider) validateToken(ctx context.Context, tokenStr, clientID str
 	return claims, nil
 }
 
-// exchangeCode redeems an authorization code for an id_token. The client
-// authenticates with clientSecret, or with assertion, a JWT, when it has no
-// secret; with neither, it is a public client.
-func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI, clientID, clientSecret, assertion string) (string, error) {
+// tokens is what the token endpoint returns. RefreshToken is empty when the
+// issuer doesn't issue one.
+type tokens struct {
+	IDToken      string `json:"id_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// clientAuth is how the client authenticates to the token endpoint: with its
+// secret, or with assertion, a JWT, when it has no secret; with neither, it is
+// a public client.
+type clientAuth struct {
+	clientID  string
+	secret    string
+	assertion string
+}
+
+// exchangeCode redeems an authorization code for tokens.
+func (p *oidcProvider) exchangeCode(ctx context.Context, code, verifier, redirectURI string, auth clientAuth) (tokens, error) {
+	return p.requestTokens(ctx, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"code_verifier": {verifier},
+		"redirect_uri":  {redirectURI},
+	}, auth)
+}
+
+// refresh redeems a refresh token for tokens.
+func (p *oidcProvider) refresh(ctx context.Context, refreshToken string, auth clientAuth) (tokens, error) {
+	return p.requestTokens(ctx, url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+	}, auth)
+}
+
+// requestTokens posts form to the token endpoint and returns the tokens,
+// which always include an id_token.
+func (p *oidcProvider) requestTokens(ctx context.Context, form url.Values, auth clientAuth) (tokens, error) {
 	provider, err := p.get(ctx)
 	if err != nil {
-		return "", err
+		return tokens{}, err
 	}
-	endpoint := provider.Endpoint()
-	if clientSecret == "" {
+	if auth.secret == "" {
 		// Only client_id goes in the body, never an empty Basic password.
-		endpoint.AuthStyle = oauth2.AuthStyleInParams
+		form.Set("client_id", auth.clientID)
 	}
-	cfg := &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		Endpoint:     endpoint,
-		RedirectURL:  redirectURI,
-		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
+	if auth.assertion != "" {
+		form.Set("client_assertion_type", clientAssertionType)
+		form.Set("client_assertion", auth.assertion)
 	}
-	opts := []oauth2.AuthCodeOption{oauth2.SetAuthURLParam("code_verifier", verifier)}
-	if assertion != "" {
-		opts = append(opts,
-			oauth2.SetAuthURLParam("client_assertion_type", clientAssertionType),
-			oauth2.SetAuthURLParam("client_assertion", assertion),
-		)
-	}
-	token, err := cfg.Exchange(oidc.ClientContext(ctx, oidcHTTPClient), code, opts...)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint().TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("token exchange: %w", err)
+		return tokens{}, err
 	}
-	raw, ok := token.Extra("id_token").(string)
-	if !ok || raw == "" {
-		return "", fmt.Errorf("no id_token in token response")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	if auth.secret != "" {
+		// RFC 6749 section 2.3.1: both are form-encoded before Basic encoding.
+		req.SetBasicAuth(url.QueryEscape(auth.clientID), url.QueryEscape(auth.secret))
 	}
-	return raw, nil
+
+	resp, err := oidcHTTPClient.Do(req)
+	if err != nil {
+		return tokens{}, fmt.Errorf("token request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return tokens{}, fmt.Errorf("reading token response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var oauthErr struct {
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
+		}
+		_ = json.Unmarshal(body, &oauthErr)
+		return tokens{}, fmt.Errorf("token request: %s: %s %s", resp.Status, oauthErr.Error, oauthErr.Description)
+	}
+
+	var t tokens
+	if err := json.Unmarshal(body, &t); err != nil {
+		return tokens{}, fmt.Errorf("parsing token response: %w", err)
+	}
+	if t.IDToken == "" {
+		return tokens{}, fmt.Errorf("no id_token in token response")
+	}
+	return t, nil
 }
 
 func (p *oidcProvider) authURL(ctx context.Context, clientID, redirectURI, state, challenge, prompt string) (string, error) {
