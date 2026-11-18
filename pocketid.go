@@ -11,6 +11,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/pdeslaur/caddy-pocketid/internal/issuer"
+	"github.com/pdeslaur/caddy-pocketid/internal/state"
 	"go.uber.org/zap"
 )
 
@@ -49,7 +51,7 @@ type Middleware struct {
 	Headers         []HeaderPair  `json:"headers,omitempty"`
 	ClaimHeaders    []ClaimHeader `json:"claim_headers,omitempty"`
 
-	oidc *oidcProvider
+	issuer *issuer.Provider
 	// stateKey signs the OAuth2 state: the client secret, or a random key
 	// without one, so a restart fails only the logins in flight.
 	stateKey string
@@ -96,7 +98,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	}
 	m.stateKey = m.ClientSecret
 	if m.stateKey == "" {
-		key, err := generateNonce()
+		key, err := state.NewNonce()
 		if err != nil {
 			return fmt.Errorf("generating state key: %w", err)
 		}
@@ -104,7 +106,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	}
 
 	m.logger = ctx.Logger()
-	m.oidc = newOIDCProvider(m.Issuer)
+	m.issuer = issuer.New(m.Issuer)
 	return nil
 }
 
@@ -119,7 +121,7 @@ func (m *Middleware) Validate() error {
 }
 
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if _, err := m.oidc.get(r.Context()); err != nil {
+	if _, err := m.issuer.Discover(r.Context()); err != nil {
 		m.logger.Error("OIDC provider unavailable", zap.Error(err))
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
@@ -129,7 +131,7 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	}
 
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		claims, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID)
+		claims, err := m.issuer.ValidateToken(r.Context(), cookie.Value, m.ClientID)
 		if err == nil {
 			return next.ServeHTTP(w, m.injectHeaders(r, claims))
 		}
@@ -158,13 +160,13 @@ func (m *Middleware) refreshSession(w http.ResponseWriter, r *http.Request) (map
 		m.logger.Error("client assertion unavailable", zap.Error(err))
 		return nil, false
 	}
-	t, err := m.oidc.refresh(r.Context(), cookie.Value, auth)
+	t, err := m.issuer.Refresh(r.Context(), cookie.Value, auth)
 	if err != nil {
 		m.logger.Info("refresh failed", zap.Error(err))
 		m.clearRefreshCookie(w)
 		return nil, false
 	}
-	claims, err := m.oidc.validateToken(r.Context(), t.IDToken, m.ClientID)
+	claims, err := m.issuer.ValidateToken(r.Context(), t.IDToken, m.ClientID)
 	if err != nil {
 		m.logger.Error("refreshed id_token validation failed", zap.Error(err))
 		m.clearRefreshCookie(w)
@@ -230,14 +232,14 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	state, err := verifyState(stateParam, m.stateKey)
+	payload, err := state.Verify(stateParam, m.stateKey)
 	if err != nil {
 		m.logger.Warn("invalid state in callback", zap.Error(err))
 		http.Error(w, "invalid state", http.StatusBadRequest)
 		return nil
 	}
 
-	verifierCookie, err := r.Cookie(pkceCookiePrefix + state.Nonce)
+	verifierCookie, err := r.Cookie(pkceCookiePrefix + payload.Nonce)
 	if err != nil {
 		http.Error(w, "missing pkce cookie", http.StatusBadRequest)
 		return nil
@@ -250,14 +252,14 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	t, err := m.oidc.exchangeCode(r.Context(), code, verifierCookie.Value, m.callbackURI(r), auth)
+	t, err := m.issuer.ExchangeCode(r.Context(), code, verifierCookie.Value, m.callbackURI(r), auth)
 	if err != nil {
 		m.logger.Error("token exchange failed", zap.Error(err))
 		http.Error(w, "token exchange failed", http.StatusInternalServerError)
 		return nil
 	}
 
-	if _, err := m.oidc.validateToken(r.Context(), t.IDToken, m.ClientID); err != nil {
+	if _, err := m.issuer.ValidateToken(r.Context(), t.IDToken, m.ClientID); err != nil {
 		m.logger.Error("id_token validation failed", zap.Error(err))
 		http.Error(w, "invalid id_token", http.StatusBadGateway)
 		return nil
@@ -272,26 +274,26 @@ func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) erro
 		MaxAge: -1,
 	})
 
-	http.Redirect(w, r, state.ReturnURL, http.StatusFound)
+	http.Redirect(w, r, payload.ReturnURL, http.StatusFound)
 	return nil
 }
 
 // clientAuth returns how the client authenticates to the token endpoint,
 // fetching a JWT-SVID with client_assertion spiffe.
-func (m *Middleware) clientAuth(r *http.Request) (clientAuth, error) {
-	auth := clientAuth{clientID: m.ClientID, secret: m.ClientSecret}
+func (m *Middleware) clientAuth(r *http.Request) (issuer.ClientAuth, error) {
+	auth := issuer.ClientAuth{ClientID: m.ClientID, Secret: m.ClientSecret}
 	if m.ClientAssertion == "spiffe" {
-		assertion, err := fetchSVID(r.Context(), m.Issuer)
+		assertion, err := issuer.FetchSVID(r.Context(), m.Issuer)
 		if err != nil {
-			return clientAuth{}, err
+			return issuer.ClientAuth{}, err
 		}
-		auth.assertion = assertion
+		auth.Assertion = assertion
 	}
 	return auth, nil
 }
 
 // setSessionCookies stores the id_token and, with Refresh, the refresh token.
-func (m *Middleware) setSessionCookies(w http.ResponseWriter, r *http.Request, t tokens) {
+func (m *Middleware) setSessionCookies(w http.ResponseWriter, r *http.Request, t issuer.Tokens) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    t.IDToken,
@@ -334,17 +336,17 @@ func (m *Middleware) cookieDomain() string {
 }
 
 func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) error {
-	verifier, challenge, err := generatePKCE()
+	verifier, challenge, err := issuer.GeneratePKCE()
 	if err != nil {
 		return fmt.Errorf("generating PKCE: %w", err)
 	}
-	nonce, err := generateNonce()
+	nonce, err := state.NewNonce()
 	if err != nil {
 		return fmt.Errorf("generating nonce: %w", err)
 	}
 
-	state := encodeState(nonce, r.URL.RequestURI(), m.stateKey)
-	authURL, err := m.oidc.authURL(r.Context(), m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
+	st := state.Encode(nonce, r.URL.RequestURI(), m.stateKey)
+	authURL, err := m.issuer.AuthURL(r.Context(), m.ClientID, m.callbackURI(r), st, challenge, m.Prompt)
 	if err != nil {
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}

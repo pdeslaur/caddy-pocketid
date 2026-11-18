@@ -24,6 +24,8 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/pdeslaur/caddy-pocketid/internal/issuer"
+	"github.com/pdeslaur/caddy-pocketid/internal/state"
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 )
@@ -87,14 +89,14 @@ type tokenRequest struct {
 	authorization string
 }
 
-// recordTokenRequests records the requests oidcHTTPClient sends to a token
+// recordTokenRequests records the requests issuer.HTTPClient sends to a token
 // endpoint until the test ends.
 func recordTokenRequests(t *testing.T) func() []tokenRequest {
 	t.Helper()
 	rec := &tokenRecorder{}
-	transport := oidcHTTPClient.Transport
-	oidcHTTPClient.Transport = rec
-	t.Cleanup(func() { oidcHTTPClient.Transport = transport })
+	transport := issuer.HTTPClient.Transport
+	issuer.HTTPClient.Transport = rec
+	t.Cleanup(func() { issuer.HTTPClient.Transport = transport })
 	return func() []tokenRequest {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
@@ -203,8 +205,8 @@ func TestClientAuthentication(t *testing.T) {
 				}
 				return
 			}
-			if got := req.form.Get("client_assertion_type"); got != clientAssertionType {
-				t.Errorf("client_assertion_type = %q, want %q", got, clientAssertionType)
+			if got := req.form.Get("client_assertion_type"); got != issuer.ClientAssertionType {
+				t.Errorf("client_assertion_type = %q, want %q", got, issuer.ClientAssertionType)
 			}
 			tok, err := jwt.ParseSigned(req.form.Get("client_assertion"), []jose.SignatureAlgorithm{jose.ES256})
 			if err != nil {
@@ -285,8 +287,8 @@ func TestStateKeyWithoutSecret(t *testing.T) {
 	if a.stateKey == "" || a.stateKey == b.stateKey {
 		t.Fatalf("state keys %q and %q: want distinct and non-empty", a.stateKey, b.stateKey)
 	}
-	state := encodeState("nonce", "/", a.stateKey)
-	if _, err := verifyState(state, b.stateKey); err == nil {
+	st := state.Encode("nonce", "/", a.stateKey)
+	if _, err := state.Verify(st, b.stateKey); err == nil {
 		t.Error("state signed by one instance verified by another")
 	}
 }

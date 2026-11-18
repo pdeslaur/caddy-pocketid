@@ -17,6 +17,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/pdeslaur/caddy-pocketid/internal/state"
 )
 
 // newTestMiddleware provisions a Middleware against a fake OIDC issuer
@@ -380,9 +381,9 @@ func TestOIDCCallbackMissingPKCECookie(t *testing.T) {
 	_, issuerURL := oidctest.NewIssuer(t)
 	m := newTestMiddleware(t, issuerURL)
 
-	state := encodeState("nonce", "/dashboard", m.ClientSecret)
+	st := state.Encode("nonce", "/dashboard", m.ClientSecret)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+state, nil)
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+st, nil)
 
 	if err := m.ServeHTTP(w, r, nopNext); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)

@@ -16,6 +16,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/pdeslaur/caddy-pocketid/internal/state"
 )
 
 // refreshIssuer is a fake OIDC issuer whose token endpoint redeems any
@@ -190,7 +191,7 @@ func TestRefreshRenewsSession(t *testing.T) {
 			if idCookie == nil {
 				t.Fatal("id_token cookie not set")
 			}
-			if _, err := m.oidc.validateToken(t.Context(), idCookie.Value, m.ClientID); err != nil {
+			if _, err := m.issuer.ValidateToken(t.Context(), idCookie.Value, m.ClientID); err != nil {
 				t.Errorf("id_token cookie invalid: %v", err)
 			}
 			refreshCookie := responseCookie(w, refreshCookieName)
@@ -265,9 +266,9 @@ func TestCallbackStoresRefreshToken(t *testing.T) {
 			m := newTestMiddleware(t, iss.URL)
 			m.Refresh = refresh
 
-			state := encodeState("nonce", "/dashboard", m.stateKey)
+			st := state.Encode("nonce", "/dashboard", m.stateKey)
 			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+state, nil)
+			r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=abc&state="+st, nil)
 			r.AddCookie(&http.Cookie{Name: pkceCookiePrefix + "nonce", Value: "verifier"})
 
 			if err := m.ServeHTTP(w, r, nopNext); err != nil {
