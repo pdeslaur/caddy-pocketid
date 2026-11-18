@@ -1,4 +1,4 @@
-package pocketid
+package issuer
 
 import (
 	"crypto/rand"
@@ -6,7 +6,8 @@ import (
 	"encoding/base64"
 )
 
-func generatePKCE() (string, string, error) {
+// GeneratePKCE returns a PKCE verifier and its S256 challenge.
+func GeneratePKCE() (string, string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", "", err

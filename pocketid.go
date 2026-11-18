@@ -1,6 +1,7 @@
 package pocketid
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,6 +11,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/pdeslaur/caddy-pocketid/internal/issuer"
+	"github.com/pdeslaur/caddy-pocketid/internal/session"
 	"go.uber.org/zap"
 )
 
@@ -19,15 +22,8 @@ func init() {
 	httpcaddyfile.RegisterDirectiveOrder("pocketid_auth", httpcaddyfile.Before, "basicauth")
 }
 
-const (
-	cookieName = "pocketid_token"
-	// pkceCookiePrefix is followed by the state nonce, giving each login flow
-	// its own verifier cookie.
-	pkceCookiePrefix = "pocketid_pkce_"
-)
-
-// Middleware gates requests behind PocketID OIDC authentication.
-// Valid sessions are identified by an RS256 id_token stored in a cookie.
+// Middleware gates requests behind PocketID OIDC authentication, and injects
+// headers into the authenticated requests it passes on.
 type Middleware struct {
 	Issuer       string `json:"issuer"`
 	ClientID     string `json:"client_id"`
@@ -39,14 +35,12 @@ type Middleware struct {
 	CookieDomain    string        `json:"cookie_domain,omitempty"`
 	CallbackPath    string        `json:"callback_path,omitempty"`
 	Prompt          string        `json:"prompt,omitempty"`
+	Refresh         bool          `json:"refresh,omitempty"`
 	Headers         []HeaderPair  `json:"headers,omitempty"`
 	ClaimHeaders    []ClaimHeader `json:"claim_headers,omitempty"`
 
-	oidc *oidcProvider
-	// stateKey signs the OAuth2 state: the client secret, or a random key
-	// without one, so a restart fails only the logins in flight.
-	stateKey string
-	logger   *zap.Logger
+	session *session.Manager
+	logger  *zap.Logger
 }
 
 // HeaderPair is a static header injected into every authenticated request.
@@ -87,17 +81,25 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.CallbackPath == "" {
 		m.CallbackPath = "/auth/callback"
 	}
-	m.stateKey = m.ClientSecret
-	if m.stateKey == "" {
-		key, err := generateNonce()
-		if err != nil {
-			return fmt.Errorf("generating state key: %w", err)
-		}
-		m.stateKey = key
-	}
 
 	m.logger = ctx.Logger()
-	m.oidc = newOIDCProvider(m.Issuer)
+	s, err := session.New(session.Config{
+		Issuer: m.Issuer,
+		Credentials: issuer.Credentials{
+			ClientID: m.ClientID,
+			Secret:   m.ClientSecret,
+			SPIFFE:   m.ClientAssertion == "spiffe",
+		},
+		CallbackPath: m.CallbackPath,
+		CookieDomain: m.CookieDomain,
+		Prompt:       m.Prompt,
+		Refresh:      m.Refresh,
+		Logger:       m.logger,
+	})
+	if err != nil {
+		return err
+	}
+	m.session = s
 	return nil
 }
 
@@ -112,34 +114,23 @@ func (m *Middleware) Validate() error {
 }
 
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if _, err := m.oidc.get(r.Context()); err != nil {
+	err := m.session.Handle(w, r, func(w http.ResponseWriter, r *http.Request, claims map[string]any) error {
+		return next.ServeHTTP(w, m.injectHeaders(r, claims))
+	})
+	if errors.Is(err, session.ErrIssuerUnavailable) {
 		m.logger.Error("OIDC provider unavailable", zap.Error(err))
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
-
-	if r.URL.Path == m.CallbackPath {
-		return m.handleCallback(w, r)
-	}
-
-	if cookie, err := r.Cookie(cookieName); err == nil {
-		claims, err := m.oidc.validateToken(r.Context(), cookie.Value, m.ClientID)
-		if err == nil {
-			return next.ServeHTTP(w, m.injectHeaders(r, claims))
-		}
-		m.logger.Debug("rejecting token cookie", zap.Error(err))
-	}
-
-	return m.redirectToAuth(w, r)
+	return err
 }
 
-// injectHeaders clones the request and sets static and claim-derived headers.
-// Claim headers are always removed from the incoming request first, so a
-// client cannot supply its own value when the claim is absent from the token.
+// injectHeaders clones the request, removes the session cookies, and sets
+// static and claim-derived headers. Claim headers are always removed from the
+// incoming request first, so a client cannot supply its own value when the
+// claim is absent from the token.
 func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http.Request {
-	if len(m.Headers) == 0 && len(m.ClaimHeaders) == 0 {
-		return r
-	}
 	r = r.Clone(r.Context())
+	session.StripCookies(r.Header)
 	for _, h := range m.Headers {
 		r.Header.Set(h.Key, h.Value)
 	}
@@ -150,117 +141,6 @@ func (m *Middleware) injectHeaders(r *http.Request, claims map[string]any) *http
 		}
 	}
 	return r
-}
-
-func (m *Middleware) handleCallback(w http.ResponseWriter, r *http.Request) error {
-	code := r.URL.Query().Get("code")
-	stateParam := r.URL.Query().Get("state")
-
-	if errParam := r.URL.Query().Get("error"); errParam != "" {
-		m.logger.Warn("auth error from provider", zap.String("error", errParam),
-			zap.String("description", r.URL.Query().Get("error_description")))
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
-		return nil
-	}
-
-	state, err := verifyState(stateParam, m.stateKey)
-	if err != nil {
-		m.logger.Warn("invalid state in callback", zap.Error(err))
-		http.Error(w, "invalid state", http.StatusBadRequest)
-		return nil
-	}
-
-	verifierCookie, err := r.Cookie(pkceCookiePrefix + state.Nonce)
-	if err != nil {
-		http.Error(w, "missing pkce cookie", http.StatusBadRequest)
-		return nil
-	}
-
-	var assertion string
-	if m.ClientAssertion == "spiffe" {
-		assertion, err = fetchSVID(r.Context(), m.Issuer)
-		if err != nil {
-			m.logger.Error("client assertion unavailable", zap.Error(err))
-			http.Error(w, "client assertion unavailable", http.StatusBadGateway)
-			return nil
-		}
-	}
-
-	idToken, err := m.oidc.exchangeCode(r.Context(), code, verifierCookie.Value,
-		m.callbackURI(r), m.ClientID, m.ClientSecret, assertion)
-	if err != nil {
-		m.logger.Error("token exchange failed", zap.Error(err))
-		http.Error(w, "token exchange failed", http.StatusInternalServerError)
-		return nil
-	}
-
-	if _, err := m.oidc.validateToken(r.Context(), idToken, m.ClientID); err != nil {
-		m.logger.Error("id_token validation failed", zap.Error(err))
-		http.Error(w, "invalid id_token", http.StatusBadGateway)
-		return nil
-	}
-
-	cookieDomain := ""
-	if m.CookieDomain != "" {
-		cookieDomain = "." + m.CookieDomain
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    idToken,
-		Domain:   cookieDomain,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	http.SetCookie(w, &http.Cookie{
-		Name:   verifierCookie.Name,
-		Value:  "",
-		Path:   m.CallbackPath,
-		MaxAge: -1,
-	})
-
-	http.Redirect(w, r, state.ReturnURL, http.StatusFound)
-	return nil
-}
-
-func (m *Middleware) redirectToAuth(w http.ResponseWriter, r *http.Request) error {
-	verifier, challenge, err := generatePKCE()
-	if err != nil {
-		return fmt.Errorf("generating PKCE: %w", err)
-	}
-	nonce, err := generateNonce()
-	if err != nil {
-		return fmt.Errorf("generating nonce: %w", err)
-	}
-
-	state := encodeState(nonce, r.URL.RequestURI(), m.stateKey)
-	authURL, err := m.oidc.authURL(r.Context(), m.ClientID, m.callbackURI(r), state, challenge, m.Prompt)
-	if err != nil {
-		return caddyhttp.Error(http.StatusBadGateway, err)
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     pkceCookiePrefix + nonce,
-		Value:    verifier,
-		Path:     m.CallbackPath,
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   300,
-	})
-
-	http.Redirect(w, r, authURL, http.StatusFound)
-	return nil
-}
-
-func (m *Middleware) callbackURI(r *http.Request) string {
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	return scheme + "://" + r.Host + m.CallbackPath
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
@@ -310,6 +190,11 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.Prompt = d.Val()
+		case "refresh":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			m.Refresh = true
 		case "set_header":
 			args := d.RemainingArgs()
 			if len(args) != 2 {

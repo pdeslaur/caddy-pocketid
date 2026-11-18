@@ -92,9 +92,28 @@ example.com {
 
 See the [Caddy matcher documentation](https://caddyserver.com/docs/caddyfile/matchers) for the full list of available matchers.
 
+### Refreshing sessions
+
+With `refresh`, the plugin keeps the refresh token PocketID issues with the id_token in a second cookie, `pocketid_refresh`, for 30 days, PocketID's default refresh token lifetime. Once the id_token has expired, or its cookie is gone after the browser restarts, the plugin redeems the refresh token, authenticating the client as it does for a login, and serves the request without a redirect. This keeps `fetch` requests, form posts and WebSockets working past the id_token's lifetime, which a redirect to PocketID would break. PocketID rotates the refresh token and checks again that the user is allowed the client on each refresh. A refresh token PocketID rejects is cleared, and the request redirects to log in.
+
+```caddyfile
+example.com {
+    pocketid_auth {
+        issuer        https://id.example.com
+        client_id     {$POCKETID_CLIENT_ID}
+        client_secret {$POCKETID_CLIENT_SECRET}
+        refresh
+    }
+
+    reverse_proxy localhost:8080
+}
+```
+
+Neither session cookie is forwarded to the backend.
+
 ### Clients without a secret
 
-With `client_assertion spiffe` and no `client_secret`, each code exchange authenticates the client with a JWT-SVID (RFC 7523), fetched from the [SPIFFE Workload API](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/#spiffe-workload-api) at `SPIFFE_ENDPOINT_SOCKET` with the issuer as its audience. In PocketID, give the client a federated identity whose issuer is your SPIRE server's JWT issuer, whose subject is the workload's SPIFFE ID, and whose audience is the issuer URL here. A login fails with 502 when the Workload API can't be reached.
+With `client_assertion spiffe` and no `client_secret`, each code exchange and refresh authenticates the client with a JWT-SVID (RFC 7523), fetched from the [SPIFFE Workload API](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/#spiffe-workload-api) at `SPIFFE_ENDPOINT_SOCKET` with the issuer as its audience. In PocketID, give the client a federated identity whose issuer is your SPIRE server's JWT issuer, whose subject is the workload's SPIFFE ID, and whose audience is the issuer URL here. A login fails with 502 when the Workload API can't be reached.
 
 ```caddyfile
 example.com {
@@ -123,5 +142,6 @@ Without a secret, the OAuth2 state is signed with a random key made at startup, 
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
 | `prompt` | No | — | OIDC [`prompt` parameter](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) sent on every authorization request. Common values: `login` (force re-authentication), `consent` (force consent screen), `select_account`, `none`. |
+| `refresh` | No | off | Renew expired sessions with PocketID's refresh token instead of redirecting; see [Refreshing sessions](#refreshing-sessions). |
 | `set_header key value` | No | — | Inject a static header into every authenticated request before it reaches the backend. Can be repeated. Use `{$VAR}` for secrets (e.g. a shared Basic Auth credential). |
 | `forward_claim claim header` | No | — | Forward a JWT claim from the session token as a request header. Can be repeated. Common claims: `sub`, `email`, `name`, `preferred_username`. |

@@ -1,4 +1,4 @@
-package pocketid
+package issuer
 
 import (
 	"context"

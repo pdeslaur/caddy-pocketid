@@ -1,4 +1,4 @@
-package pocketid
+package issuer
 
 import (
 	"crypto/sha256"
@@ -7,9 +7,9 @@ import (
 )
 
 func TestGeneratePKCE(t *testing.T) {
-	verifier, challenge, err := generatePKCE()
+	verifier, challenge, err := GeneratePKCE()
 	if err != nil {
-		t.Fatalf("generatePKCE: %v", err)
+		t.Fatalf("GeneratePKCE: %v", err)
 	}
 
 	vBytes, err := base64.RawURLEncoding.DecodeString(verifier)
@@ -28,15 +28,15 @@ func TestGeneratePKCE(t *testing.T) {
 }
 
 func TestGeneratePKCEUnique(t *testing.T) {
-	v1, _, err := generatePKCE()
+	v1, _, err := GeneratePKCE()
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	v2, _, err := generatePKCE()
+	v2, _, err := GeneratePKCE()
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 	if v1 == v2 {
-		t.Error("two generatePKCE calls returned identical verifiers")
+		t.Error("two GeneratePKCE calls returned identical verifiers")
 	}
 }

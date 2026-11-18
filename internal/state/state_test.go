@@ -1,4 +1,4 @@
-package pocketid
+package state
 
 import (
 	"encoding/base64"
@@ -19,10 +19,10 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			state := encodeState("nonce", tc.url, tc.secret)
-			got, err := verifyState(state, tc.secret)
+			state := Encode("nonce", tc.url, tc.secret)
+			got, err := Verify(state, tc.secret)
 			if err != nil {
-				t.Fatalf("verifyState: %v", err)
+				t.Fatalf("Verify: %v", err)
 			}
 			if got.ReturnURL != tc.url {
 				t.Errorf("ReturnURL = %q, want %q", got.ReturnURL, tc.url)
@@ -35,13 +35,13 @@ func TestStateRoundTrip(t *testing.T) {
 }
 
 func TestGenerateNonceUnique(t *testing.T) {
-	a, err := generateNonce()
+	a, err := NewNonce()
 	if err != nil {
-		t.Fatalf("generateNonce: %v", err)
+		t.Fatalf("NewNonce: %v", err)
 	}
-	b, err := generateNonce()
+	b, err := NewNonce()
 	if err != nil {
-		t.Fatalf("generateNonce: %v", err)
+		t.Fatalf("NewNonce: %v", err)
 	}
 	if a == b {
 		t.Error("two calls returned the same nonce")
@@ -49,32 +49,32 @@ func TestGenerateNonceUnique(t *testing.T) {
 }
 
 func TestStateWrongSecret(t *testing.T) {
-	state := encodeState("nonce", "/foo", "secret")
-	_, err := verifyState(state, "wrong")
+	state := Encode("nonce", "/foo", "secret")
+	_, err := Verify(state, "wrong")
 	if err == nil {
 		t.Error("expected error with wrong secret, got nil")
 	}
 }
 
 func TestStateTamperedSignature(t *testing.T) {
-	state := encodeState("nonce", "/foo", "secret")
+	state := Encode("nonce", "/foo", "secret")
 	dot := strings.Index(state, ".")
 	tampered := state[:dot+1] + "invalidsig"
-	_, err := verifyState(tampered, "secret")
+	_, err := Verify(tampered, "secret")
 	if err == nil {
 		t.Error("expected error with tampered signature, got nil")
 	}
 }
 
 func TestStateInvalidFormat(t *testing.T) {
-	_, err := verifyState("nodothere", "secret")
+	_, err := Verify("nodothere", "secret")
 	if err == nil {
 		t.Error("expected error for missing dot separator, got nil")
 	}
 }
 
 func TestStateInvalidBase64Payload(t *testing.T) {
-	_, err := verifyState("!!!."+signState("!!!", "secret"), "secret")
+	_, err := Verify("!!!."+sign("!!!", "secret"), "secret")
 	if err == nil {
 		t.Error("expected error for invalid base64 payload, got nil")
 	}
@@ -82,7 +82,7 @@ func TestStateInvalidBase64Payload(t *testing.T) {
 
 func TestStateMissingNonce(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(`{"r":"/foo"}`))
-	_, err := verifyState(encoded+"."+signState(encoded, "secret"), "secret")
+	_, err := Verify(encoded+"."+sign(encoded, "secret"), "secret")
 	if err == nil {
 		t.Error("expected error for state without nonce, got nil")
 	}
