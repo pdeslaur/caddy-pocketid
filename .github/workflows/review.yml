@@ -1,0 +1,28 @@
+name: Review
+# Requests a review from pdeslaur on a bot's pull request when its checks fail
+# or time out, since auto-merge then waits on a person.
+#
+# workflow_run runs this workflow as it is on main, with a GITHUB_TOKEN that
+# can write, even when Dependabot triggered the run. It never checks out the
+# pull request's code.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+permissions: {}
+jobs:
+  request-review:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.type == 'Bot' &&
+      contains(fromJSON('["failure", "timed_out"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    timeout-minutes: 5
+    steps:
+      - name: Request review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/requested_reviewers" -f "reviewers[]=pdeslaur"
