@@ -3,7 +3,7 @@ name: Review
 # or time out, since auto-merge then waits on a person.
 #
 # workflow_run runs this workflow as it is on main, with a GITHUB_TOKEN that
-# can write, even when Dependabot triggered the run. It never checks out the
+# can write, even when a bot triggered the run. It never checks out the
 # pull request's code.
 on:
   workflow_run:
