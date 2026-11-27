@@ -370,17 +370,17 @@ func TestCallbackClientAssertionUnavailable(t *testing.T) {
 	}
 }
 
-func TestCallbackURIScheme(t *testing.T) {
-	m := &Manager{cfg: Config{CallbackPath: testCallbackPath}}
+func TestAbsoluteURLScheme(t *testing.T) {
+	m := &Manager{}
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Host = "example.com"
-	if got := m.callbackURI(r); got != "http://example.com/auth/callback" {
+	if got := m.absoluteURL(r, testCallbackPath); got != "http://example.com/auth/callback" {
 		t.Errorf("plain request: got %q", got)
 	}
 
 	r.TLS = &tls.ConnectionState{}
-	if got := m.callbackURI(r); got != "https://example.com/auth/callback" {
+	if got := m.absoluteURL(r, testCallbackPath); got != "https://example.com/auth/callback" {
 		t.Errorf("TLS request: got %q", got)
 	}
 }

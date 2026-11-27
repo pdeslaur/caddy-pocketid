@@ -186,3 +186,36 @@ func (p *Provider) AuthURL(ctx context.Context, clientID, redirectURI, state, ch
 	}
 	return cfg.AuthCodeURL(state, opts...), nil
 }
+
+// EndSessionURL returns the URL of the issuer's end_session_endpoint (OpenID
+// Connect RP-Initiated Logout) ending the session idToken was issued in, and
+// returning the browser to postLogoutRedirect; or an empty string when the
+// issuer has none. An empty idToken is left out, for the issuer to ask the
+// user instead.
+func (p *Provider) EndSessionURL(ctx context.Context, clientID, idToken, postLogoutRedirect string) (string, error) {
+	provider, err := p.Discover(ctx)
+	if err != nil {
+		return "", err
+	}
+	var metadata struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if err := provider.Claims(&metadata); err != nil {
+		return "", fmt.Errorf("parsing discovery: %w", err)
+	}
+	if metadata.EndSessionEndpoint == "" {
+		return "", nil
+	}
+	u, err := url.Parse(metadata.EndSessionEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("parsing end_session_endpoint: %w", err)
+	}
+	q := u.Query()
+	q.Set("client_id", clientID)
+	q.Set("post_logout_redirect_uri", postLogoutRedirect)
+	if idToken != "" {
+		q.Set("id_token_hint", idToken)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}

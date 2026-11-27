@@ -389,6 +389,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		client_assertion spiffe
 		cookie_domain example.com
 		callback_path /cb
+		logout_path /logout
+		post_logout_redirect /bye
 		prompt login
 		refresh
 		set_header X-Auth-Source pocketid
@@ -398,16 +400,18 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
 	want := Middleware{
-		Issuer:          "https://id.example.com",
-		ClientID:        "test-client",
-		ClientSecret:    "test-secret",
-		ClientAssertion: "spiffe",
-		CookieDomain:    "example.com",
-		CallbackPath:    "/cb",
-		Prompt:          "login",
-		Refresh:         true,
-		Headers:         []HeaderPair{{Key: "X-Auth-Source", Value: "pocketid"}},
-		ClaimHeaders:    []ClaimHeader{{Claim: "email", Header: "X-Remote-Email"}},
+		Issuer:             "https://id.example.com",
+		ClientID:           "test-client",
+		ClientSecret:       "test-secret",
+		ClientAssertion:    "spiffe",
+		CookieDomain:       "example.com",
+		CallbackPath:       "/cb",
+		LogoutPath:         "/logout",
+		PostLogoutRedirect: "/bye",
+		Prompt:             "login",
+		Refresh:            true,
+		Headers:            []HeaderPair{{Key: "X-Auth-Source", Value: "pocketid"}},
+		ClaimHeaders:       []ClaimHeader{{Claim: "email", Header: "X-Remote-Email"}},
 	}
 	if !reflect.DeepEqual(m, want) {
 		t.Errorf("got %+v, want %+v", m, want)
@@ -416,6 +420,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	for _, bad := range []string{
 		"refresh yes",
 		"issuer",
+		"logout_path",
+		"post_logout_redirect",
 		"set_header X-Only-Key",
 		"forward_claim email",
 		"unknown value",
@@ -423,6 +429,31 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		d := caddyfile.NewTestDispenser("pocketid_auth {\n" + bad + "\n}")
 		if err := (&Middleware{}).UnmarshalCaddyfile(d); err == nil {
 			t.Errorf("%q: want error", bad)
+		}
+	}
+}
+
+func TestValidateLogout(t *testing.T) {
+	for _, tt := range []struct {
+		logoutPath, postLogoutRedirect string
+		ok                             bool
+	}{
+		{"", "", true},
+		{"/logout", "/", true},
+		{"/logout", "/signed-out", true},
+		{"logout", "/", false},
+		{"/auth/callback", "/", false},
+		{"/logout", "https://example.com/", false},
+		{"", "/", false},
+	} {
+		m := Middleware{
+			Issuer:             "https://id.example.com",
+			CallbackPath:       "/auth/callback",
+			LogoutPath:         tt.logoutPath,
+			PostLogoutRedirect: tt.postLogoutRedirect,
+		}
+		if err := m.Validate(); (err == nil) != tt.ok {
+			t.Errorf("logout_path %q, post_logout_redirect %q: Validate() = %v, want ok %v", tt.logoutPath, tt.postLogoutRedirect, err, tt.ok)
 		}
 	}
 }

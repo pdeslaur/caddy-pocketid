@@ -4,6 +4,7 @@
 package session
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,6 +37,10 @@ type Config struct {
 	Issuer       string
 	Credentials  issuer.Credentials
 	CallbackPath string
+	// LogoutPath, when set, clears the session and ends the issuer's own, then
+	// returns the browser to PostLogoutRedirect.
+	LogoutPath         string
+	PostLogoutRedirect string
 	// CookieDomain scopes the session cookies to a domain and its subdomains;
 	// empty scopes them to the request's host.
 	CookieDomain string
@@ -95,6 +100,10 @@ func (m *Manager) Handle(w http.ResponseWriter, r *http.Request, next Next) erro
 		return nil
 	}
 
+	if m.cfg.LogoutPath != "" && r.URL.Path == m.cfg.LogoutPath {
+		return m.logout(w, r)
+	}
+
 	if claims, ok := m.authenticate(w, r); ok {
 		return next(w, r, claims)
 	}
@@ -134,13 +143,13 @@ func (m *Manager) refresh(w http.ResponseWriter, r *http.Request) (map[string]an
 	}
 	if err != nil {
 		m.logger.Info("refresh failed", zap.Error(err))
-		m.clearRefreshCookie(w)
+		m.clearCookie(w, RefreshCookie)
 		return nil, false
 	}
 	claims, err := m.issuer.ValidateToken(r.Context(), t.IDToken, m.cfg.Credentials.ClientID)
 	if err != nil {
 		m.logger.Error("refreshed id_token validation failed", zap.Error(err))
-		m.clearRefreshCookie(w)
+		m.clearCookie(w, RefreshCookie)
 		return nil, false
 	}
 	if t.RefreshToken == "" {
@@ -174,7 +183,7 @@ func (m *Manager) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := m.issuer.ExchangeCode(r.Context(), code, verifierCookie.Value, m.callbackURI(r), m.cfg.Credentials)
+	t, err := m.issuer.ExchangeCode(r.Context(), code, verifierCookie.Value, m.absoluteURL(r, m.cfg.CallbackPath), m.cfg.Credentials)
 	if errors.Is(err, issuer.ErrClientAssertion) {
 		m.logger.Error("token exchange failed", zap.Error(err))
 		http.Error(w, "client assertion unavailable", http.StatusBadGateway)
@@ -215,7 +224,7 @@ func (m *Manager) redirectToLogin(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	st := state.Encode(nonce, r.URL.RequestURI(), m.stateKey)
-	authURL, err := m.issuer.AuthURL(r.Context(), m.cfg.Credentials.ClientID, m.callbackURI(r), st, challenge, m.cfg.Prompt)
+	authURL, err := m.issuer.AuthURL(r.Context(), m.cfg.Credentials.ClientID, m.absoluteURL(r, m.cfg.CallbackPath), st, challenge, m.cfg.Prompt)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrIssuerUnavailable, err)
 	}
@@ -260,9 +269,10 @@ func (m *Manager) setCookies(w http.ResponseWriter, r *http.Request, t issuer.To
 	})
 }
 
-func (m *Manager) clearRefreshCookie(w http.ResponseWriter) {
+// clearCookie deletes the session cookie name.
+func (m *Manager) clearCookie(w http.ResponseWriter, name string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:   RefreshCookie,
+		Name:   name,
 		Value:  "",
 		Domain: m.cookieDomain(),
 		Path:   "/",
@@ -277,12 +287,13 @@ func (m *Manager) cookieDomain() string {
 	return "." + m.cfg.CookieDomain
 }
 
-func (m *Manager) callbackURI(r *http.Request) string {
+// absoluteURL returns the URL of path on the request's host.
+func (m *Manager) absoluteURL(r *http.Request, path string) string {
 	scheme := "https"
 	if r.TLS == nil {
 		scheme = "http"
 	}
-	return scheme + "://" + r.Host + m.cfg.CallbackPath
+	return scheme + "://" + r.Host + path
 }
 
 // StripCookies removes the session cookies from the Cookie headers, so the
@@ -306,4 +317,31 @@ func StripCookies(h http.Header) {
 	for _, line := range kept {
 		h.Add("Cookie", line)
 	}
+}
+
+// logout clears the session cookies and sends the browser to the issuer's
+// end_session_endpoint, with the id_token as its hint, to end the issuer's
+// own session, which then returns it to PostLogoutRedirect; or straight
+// there, when the issuer has no end_session_endpoint. A cross-site request is
+// refused, so that another site can't sign users out.
+func (m *Manager) logout(w http.ResponseWriter, r *http.Request) error {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		http.Error(w, "cross-site logout refused", http.StatusForbidden)
+		return nil
+	}
+	var idToken string
+	if cookie, err := r.Cookie(TokenCookie); err == nil {
+		idToken = cookie.Value
+	}
+	returnURL := m.absoluteURL(r, m.cfg.PostLogoutRedirect)
+	endSession, err := m.issuer.EndSessionURL(r.Context(), m.cfg.Credentials.ClientID, idToken, returnURL)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrIssuerUnavailable, err)
+	}
+	m.clearCookie(w, TokenCookie)
+	m.clearCookie(w, RefreshCookie)
+	http.Redirect(w, r, cmp.Or(endSession, returnURL), http.StatusFound)
+	return nil
 }

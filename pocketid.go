@@ -31,13 +31,17 @@ type Middleware struct {
 	// ClientAssertion authenticates the client without a secret: "spiffe"
 	// sends a JWT-SVID from the SPIFFE Workload API, for the issuer as its
 	// audience.
-	ClientAssertion string        `json:"client_assertion,omitempty"`
-	CookieDomain    string        `json:"cookie_domain,omitempty"`
-	CallbackPath    string        `json:"callback_path,omitempty"`
-	Prompt          string        `json:"prompt,omitempty"`
-	Refresh         bool          `json:"refresh,omitempty"`
-	Headers         []HeaderPair  `json:"headers,omitempty"`
-	ClaimHeaders    []ClaimHeader `json:"claim_headers,omitempty"`
+	ClientAssertion string `json:"client_assertion,omitempty"`
+	CookieDomain    string `json:"cookie_domain,omitempty"`
+	CallbackPath    string `json:"callback_path,omitempty"`
+	// LogoutPath, when set, signs the user out: it clears the session, and
+	// ends PocketID's own, which returns the browser to PostLogoutRedirect.
+	LogoutPath         string        `json:"logout_path,omitempty"`
+	PostLogoutRedirect string        `json:"post_logout_redirect,omitempty"`
+	Prompt             string        `json:"prompt,omitempty"`
+	Refresh            bool          `json:"refresh,omitempty"`
+	Headers            []HeaderPair  `json:"headers,omitempty"`
+	ClaimHeaders       []ClaimHeader `json:"claim_headers,omitempty"`
 
 	session *session.Manager
 	logger  *zap.Logger
@@ -81,6 +85,9 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.CallbackPath == "" {
 		m.CallbackPath = "/auth/callback"
 	}
+	if m.LogoutPath != "" && m.PostLogoutRedirect == "" {
+		m.PostLogoutRedirect = "/"
+	}
 
 	m.logger = ctx.Logger()
 	s, err := session.New(session.Config{
@@ -90,11 +97,13 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 			Secret:   m.ClientSecret,
 			SPIFFE:   m.ClientAssertion == "spiffe",
 		},
-		CallbackPath: m.CallbackPath,
-		CookieDomain: m.CookieDomain,
-		Prompt:       m.Prompt,
-		Refresh:      m.Refresh,
-		Logger:       m.logger,
+		CallbackPath:       m.CallbackPath,
+		LogoutPath:         m.LogoutPath,
+		PostLogoutRedirect: m.PostLogoutRedirect,
+		CookieDomain:       m.CookieDomain,
+		Prompt:             m.Prompt,
+		Refresh:            m.Refresh,
+		Logger:             m.logger,
 	})
 	if err != nil {
 		return err
@@ -109,6 +118,15 @@ func (m *Middleware) Validate() error {
 	}
 	if !strings.HasPrefix(m.CallbackPath, "/") {
 		return fmt.Errorf("callback_path must begin with /")
+	}
+	if m.LogoutPath != "" && !strings.HasPrefix(m.LogoutPath, "/") {
+		return fmt.Errorf("logout_path must begin with /")
+	}
+	if m.LogoutPath != "" && m.LogoutPath == m.CallbackPath {
+		return fmt.Errorf("logout_path and callback_path must differ")
+	}
+	if m.PostLogoutRedirect != "" && (m.LogoutPath == "" || !strings.HasPrefix(m.PostLogoutRedirect, "/")) {
+		return fmt.Errorf("post_logout_redirect must begin with / and needs logout_path")
 	}
 	return nil
 }
@@ -185,6 +203,16 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			m.CallbackPath = d.Val()
+		case "logout_path":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.LogoutPath = d.Val()
+		case "post_logout_redirect":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.PostLogoutRedirect = d.Val()
 		case "prompt":
 			if !d.NextArg() {
 				return d.ArgErr()
