@@ -111,6 +111,25 @@ example.com {
 
 Neither session cookie is forwarded to the backend.
 
+### Signing out
+
+With `logout_path`, a request to that path signs the user out: the plugin deletes both session cookies and redirects to PocketID's `end_session_endpoint` ([RP-Initiated Logout](https://openid.net/specs/openid-connect-rpinitiated-1_0.html)), with the id_token as `id_token_hint`. PocketID ends its own session and returns the browser to `post_logout_redirect`, `/` by default, on the request's host. Register that URL among the client's logout callback URLs in PocketID: otherwise PocketID asks the user to confirm and doesn't send them back. Without an id_token, PocketID asks too. A request whose `Sec-Fetch-Site` is `cross-site` or `same-site` is refused, so another site can't sign users out; a link or a script on the same site, or the address typed in, works.
+
+```caddyfile
+example.com {
+    pocketid_auth {
+        issuer        https://id.example.com
+        client_id     {$POCKETID_CLIENT_ID}
+        client_secret {$POCKETID_CLIENT_SECRET}
+        logout_path   /auth/logout
+    }
+
+    reverse_proxy localhost:8080
+}
+```
+
+Against an issuer without an `end_session_endpoint`, the plugin deletes the cookies and redirects to `post_logout_redirect` itself.
+
 ### Clients without a secret
 
 With `client_assertion spiffe` and no `client_secret`, each code exchange and refresh authenticates the client with a JWT-SVID (RFC 7523), fetched from the [SPIFFE Workload API](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/#spiffe-workload-api) at `SPIFFE_ENDPOINT_SOCKET` with the issuer as its audience. In PocketID, give the client a federated identity whose issuer is your SPIRE server's JWT issuer, whose subject is the workload's SPIFFE ID, and whose audience is the issuer URL here. A login fails with 502 when the Workload API can't be reached.
@@ -140,6 +159,8 @@ Without a secret, the OAuth2 state is signed with a random key made at startup, 
 | `client_secret` | No | — | OAuth2 client secret. Use `{$VAR}` to avoid hardcoding. Exclusive with `client_assertion`. |
 | `client_assertion` | No | — | `spiffe` authenticates the client with a JWT-SVID instead of a secret; see [Clients without a secret](#clients-without-a-secret). |
 | `callback_path` | No | `/auth/callback` | Path Caddy listens on for the OIDC redirect. Must match the redirect URI configured in PocketID. |
+| `logout_path` | No | — | Path signing the user out, here and in PocketID; see [Signing out](#signing-out). Must differ from `callback_path`. |
+| `post_logout_redirect` | No | `/` | Path the browser returns to once signed out, on the request's host. Needs `logout_path`. |
 | `cookie_domain` | No | — | Domain to scope the session cookie to (e.g. `example.com`). Useful when protecting multiple subdomains with a single login. |
 | `prompt` | No | — | OIDC [`prompt` parameter](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest) sent on every authorization request. Common values: `login` (force re-authentication), `consent` (force consent screen), `select_account`, `none`. |
 | `refresh` | No | off | Renew expired sessions with PocketID's refresh token instead of redirecting; see [Refreshing sessions](#refreshing-sessions). |

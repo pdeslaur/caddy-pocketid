@@ -27,7 +27,8 @@ type tokenRequest struct {
 
 // refreshIssuer is a fake OIDC issuer whose token endpoint redeems any
 // authorization code and rotates refresh tokens, like PocketID: each refresh
-// token can be redeemed once. It records the token requests it receives.
+// token can be redeemed once. It records the token requests it receives, and
+// advertises an end_session_endpoint, which nothing serves.
 type refreshIssuer struct {
 	*httptest.Server
 	signer jose.Signer
@@ -54,8 +55,8 @@ func newRefreshIssuer(t *testing.T) *refreshIssuer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":%q,"id_token_signing_alg_values_supported":["RS256"]}`,
-			iss.URL, iss.URL+"/authorize", iss.URL+"/token", iss.URL+"/keys")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"end_session_endpoint":%q,"jwks_uri":%q,"id_token_signing_alg_values_supported":["RS256"]}`,
+			iss.URL, iss.URL+"/authorize", iss.URL+"/token", iss.URL+"/end-session?ui=1", iss.URL+"/keys")
 	})
 	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
